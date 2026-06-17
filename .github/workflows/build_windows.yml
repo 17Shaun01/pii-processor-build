@@ -21,7 +21,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install presidio-analyzer presidio-anonymizer spacy
+          pip install presidio-analyzer presidio-anonymizer spacy click
           pip install python-docx pdfminer.six colorama tabulate pyinstaller
           python -m spacy download en_core_web_sm
 
