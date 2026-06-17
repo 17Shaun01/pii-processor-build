@@ -1,4 +1,4 @@
-name: Build Windows Executable
+name: Build Windows EXE (Hebrew + English)
 
 on:
   push:
@@ -10,73 +10,127 @@ jobs:
     runs-on: windows-latest
 
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
       - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install presidio-analyzer presidio-anonymizer spacy click
-          pip install python-docx pdfminer.six colorama tabulate pyinstaller
-          python -m spacy download en_core_web_sm
+      - name: Upgrade pip
+        run: python -m pip install --upgrade pip
 
-      - name: Build executable with PyInstaller
+      - name: Install core dependencies
         run: |
-          pyinstaller `
-            --noconfirm `
-            --onedir `
-            --windowed `
-            --name "PII_Processor" `
-            --hidden-import spacy `
-            --hidden-import spacy.lang.en `
-            --hidden-import en_core_web_sm `
-            --hidden-import presidio_analyzer `
-            --hidden-import presidio_analyzer.nlp_engine `
-            --hidden-import presidio_analyzer.predefined_recognizers `
-            --hidden-import presidio_anonymizer `
-            --hidden-import presidio_anonymizer.operators `
-            --hidden-import thinc `
-            --hidden-import thinc.api `
-            --hidden-import thinc.backends `
-            --hidden-import blis `
-            --hidden-import cymem `
-            --hidden-import preshed `
-            --hidden-import murmurhash `
-            --hidden-import srsly `
-            --hidden-import catalogue `
-            --hidden-import confection `
-            --hidden-import weasel `
-            --hidden-import phonenumbers `
-            --hidden-import colorama `
-            --hidden-import tabulate `
-            --hidden-import docx `
-            --hidden-import pdfminer `
-            --hidden-import pdfminer.high_level `
-            --hidden-import pdfminer.layout `
-            --hidden-import pdfminer.pdfpage `
-            --hidden-import pdfminer.pdfinterp `
-            --hidden-import pdfminer.converter `
-            --hidden-import pdfminer.pdfdocument `
-            --hidden-import pdfminer.pdfparser `
-            --hidden-import cryptography `
-            --hidden-import numpy `
-            --collect-all spacy `
-            --collect-all en_core_web_sm `
-            --collect-all presidio_analyzer `
-            --collect-all presidio_anonymizer `
-            --collect-all thinc `
-            --collect-all confection `
-            --collect-all phonenumbers `
+          pip install presidio-analyzer presidio-anonymizer
+          pip install spacy
+          pip install click python-docx "pdfminer.six" colorama tabulate pyinstaller
+          pip install cymem preshed murmurhash srsly catalogue confection weasel
+
+      - name: Download English spaCy model
+        run: python -m spacy download en_core_web_sm
+
+      - name: Install HebSpaCy and Hebrew NER model
+        run: |
+          pip install hebspacy
+          pip install https://github.com/8400TheHealthNetwork/HebSpaCy/releases/download/he_ner_news_trf-3.2.1/he_ner_news_trf-3.2.1-py3-none-any.whl
+        continue-on-error: true
+
+      - name: Verify models
+        shell: python
+        run: |
+          import spacy
+          for model in ("en_core_web_sm", "he_ner_news_trf"):
+              try:
+                  p = spacy.util.get_package_path(model)
+                  print(f"OK  {model}: {p}")
+              except Exception as e:
+                  print(f"N/A {model}: {e}")
+
+      - name: Build with PyInstaller
+        shell: cmd
+        run: |
+          python -m PyInstaller ^
+            --name PII_Processor ^
+            --onedir ^
+            --windowed ^
+            --noconfirm ^
+            --hidden-import presidio_analyzer ^
+            --hidden-import presidio_analyzer.predefined_recognizers ^
+            --hidden-import presidio_analyzer.predefined_recognizers.email_recognizer ^
+            --hidden-import presidio_analyzer.predefined_recognizers.phone_recognizer ^
+            --hidden-import presidio_analyzer.predefined_recognizers.ip_recognizer ^
+            --hidden-import presidio_analyzer.predefined_recognizers.iban_recognizer ^
+            --hidden-import presidio_analyzer.predefined_recognizers.credit_card_recognizer ^
+            --hidden-import presidio_analyzer.predefined_recognizers.url_recognizer ^
+            --hidden-import presidio_analyzer.nlp_engine ^
+            --hidden-import presidio_analyzer.nlp_engine.spacy_nlp_engine ^
+            --hidden-import presidio_anonymizer ^
+            --hidden-import presidio_anonymizer.operators ^
+            --hidden-import spacy ^
+            --hidden-import spacy.lang.en ^
+            --hidden-import spacy.lang.he ^
+            --hidden-import spacy.lang.xx ^
+            --hidden-import en_core_web_sm ^
+            --hidden-import thinc ^
+            --hidden-import thinc.api ^
+            --hidden-import thinc.backends ^
+            --hidden-import thinc.backends.numpy_ops ^
+            --hidden-import blis ^
+            --hidden-import cymem ^
+            --hidden-import preshed ^
+            --hidden-import murmurhash ^
+            --hidden-import srsly ^
+            --hidden-import catalogue ^
+            --hidden-import confection ^
+            --hidden-import weasel ^
+            --hidden-import phonenumbers ^
+            --hidden-import colorama ^
+            --hidden-import tabulate ^
+            --hidden-import docx ^
+            --hidden-import pdfminer ^
+            --hidden-import pdfminer.high_level ^
+            --hidden-import pdfminer.layout ^
+            --hidden-import pdfminer.pdfpage ^
+            --hidden-import pdfminer.pdfinterp ^
+            --hidden-import pdfminer.converter ^
+            --hidden-import pdfminer.pdfdocument ^
+            --hidden-import pdfminer.pdfparser ^
+            --hidden-import numpy ^
+            --hidden-import numpy.core ^
+            --hidden-import numpy.core._methods ^
+            --hidden-import numpy.lib.format ^
+            --collect-all spacy ^
+            --collect-all en_core_web_sm ^
+            --collect-all presidio_analyzer ^
+            --collect-all presidio_anonymizer ^
+            --collect-all thinc ^
+            --collect-all blis ^
+            --collect-all confection ^
+            --collect-all phonenumbers ^
             pii_processor_gui.py
+
+      - name: Bundle Hebrew model into dist (if installed)
+        shell: python
+        run: |
+          import shutil, pathlib, spacy
+          dist = pathlib.Path("dist/PII_Processor/_internal")
+          for model in ("he_ner_news_trf",):
+              try:
+                  src = pathlib.Path(spacy.util.get_package_path(model))
+                  dst = dist / model
+                  if not dst.exists():
+                      shutil.copytree(src, dst)
+                      print(f"Copied {model} -> {dst}")
+                  else:
+                      print(f"{model} already present in dist")
+              except Exception as e:
+                  print(f"Skipping {model}: {e}")
+        continue-on-error: true
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: PII_Processor_Windows
+          name: PII_Processor_Windows_Hebrew
           path: dist/PII_Processor/
           retention-days: 7
