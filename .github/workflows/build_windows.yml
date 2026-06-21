@@ -1,4 +1,4 @@
-name: Build Windows EXE (Hebrew + English)
+name: Build Windows EXE (Hebrew + English v3.0)
 
 on:
   push:
@@ -10,7 +10,8 @@ jobs:
     runs-on: windows-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout code
+        uses: actions/checkout@v4
 
       - name: Set up Python 3.11
         uses: actions/setup-python@v5
@@ -22,30 +23,41 @@ jobs:
 
       - name: Install core dependencies
         run: |
+          pip install click
           pip install presidio-analyzer presidio-anonymizer
           pip install spacy
-          pip install click python-docx "pdfminer.six" colorama tabulate pyinstaller
-          pip install cymem preshed murmurhash srsly catalogue confection weasel
+          pip install python-docx "pdfminer.six" pyinstaller
 
       - name: Download English spaCy model
         run: python -m spacy download en_core_web_sm
 
-      - name: Install HebSpaCy and Hebrew NER model
-        run: |
-          pip install hebspacy
-          pip install https://github.com/8400TheHealthNetwork/HebSpaCy/releases/download/he_ner_news_trf-3.2.1/he_ner_news_trf-3.2.1-py3-none-any.whl
-        continue-on-error: true
+      - name: Download multilingual spaCy model (Hebrew NER)
+        run: python -m spacy download xx_ent_wiki_sm
 
-      - name: Verify models
+      - name: Verify models and hebrew_data
         shell: python
         run: |
           import spacy
-          for model in ("en_core_web_sm", "he_ner_news_trf"):
+          for model in ("en_core_web_sm", "xx_ent_wiki_sm"):
               try:
                   p = spacy.util.get_package_path(model)
                   print(f"OK  {model}: {p}")
               except Exception as e:
-                  print(f"N/A {model}: {e}")
+                  print(f"FAIL {model}: {e}")
+          from hebrew_data import HEBREW_FIRST_NAMES, HEBREW_LAST_NAMES, HEBREW_LOCATIONS
+          print(f"Hebrew dict: {len(HEBREW_FIRST_NAMES)} first names, {len(HEBREW_LAST_NAMES)} last names, {len(HEBREW_LOCATIONS)} locations")
+
+      - name: Get spaCy model paths
+        shell: python
+        run: |
+          import spacy, os
+          en_path = str(spacy.util.get_package_path('en_core_web_sm'))
+          xx_path = str(spacy.util.get_package_path('xx_ent_wiki_sm'))
+          print(f"EN: {en_path}")
+          print(f"XX: {xx_path}")
+          with open(os.environ['GITHUB_ENV'], 'a') as f:
+              f.write(f"EN_MODEL_PATH={en_path}\n")
+              f.write(f"XX_MODEL_PATH={xx_path}\n")
 
       - name: Build with PyInstaller
         shell: cmd
@@ -55,6 +67,9 @@ jobs:
             --onedir ^
             --windowed ^
             --noconfirm ^
+            --add-data "%EN_MODEL_PATH%;en_core_web_sm" ^
+            --add-data "%XX_MODEL_PATH%;xx_ent_wiki_sm" ^
+            --add-data "hebrew_data.py;." ^
             --hidden-import presidio_analyzer ^
             --hidden-import presidio_analyzer.predefined_recognizers ^
             --hidden-import presidio_analyzer.predefined_recognizers.email_recognizer ^
@@ -72,6 +87,7 @@ jobs:
             --hidden-import spacy.lang.he ^
             --hidden-import spacy.lang.xx ^
             --hidden-import en_core_web_sm ^
+            --hidden-import xx_ent_wiki_sm ^
             --hidden-import thinc ^
             --hidden-import thinc.api ^
             --hidden-import thinc.backends ^
@@ -85,8 +101,6 @@ jobs:
             --hidden-import confection ^
             --hidden-import weasel ^
             --hidden-import phonenumbers ^
-            --hidden-import colorama ^
-            --hidden-import tabulate ^
             --hidden-import docx ^
             --hidden-import pdfminer ^
             --hidden-import pdfminer.high_level ^
@@ -102,6 +116,7 @@ jobs:
             --hidden-import numpy.lib.format ^
             --collect-all spacy ^
             --collect-all en_core_web_sm ^
+            --collect-all xx_ent_wiki_sm ^
             --collect-all presidio_analyzer ^
             --collect-all presidio_anonymizer ^
             --collect-all thinc ^
@@ -110,27 +125,16 @@ jobs:
             --collect-all phonenumbers ^
             pii_processor_gui.py
 
-      - name: Bundle Hebrew model into dist (if installed)
-        shell: python
+      - name: Verify build size
+        shell: powershell
         run: |
-          import shutil, pathlib, spacy
-          dist = pathlib.Path("dist/PII_Processor/_internal")
-          for model in ("he_ner_news_trf",):
-              try:
-                  src = pathlib.Path(spacy.util.get_package_path(model))
-                  dst = dist / model
-                  if not dst.exists():
-                      shutil.copytree(src, dst)
-                      print(f"Copied {model} -> {dst}")
-                  else:
-                      print(f"{model} already present in dist")
-              except Exception as e:
-                  print(f"Skipping {model}: {e}")
-        continue-on-error: true
+          $size = (Get-ChildItem -Path dist\PII_Processor -Recurse | Measure-Object -Property Length -Sum).Sum / 1MB
+          Write-Host "Build size: $([math]::Round($size, 1)) MB"
+          dir dist\PII_Processor
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: PII_Processor_Windows_Hebrew
+          name: PII_Processor_Windows_Hebrew_v3
           path: dist/PII_Processor/
           retention-days: 7
