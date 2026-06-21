@@ -37,6 +37,8 @@ jobs:
       - name: Verify models and hebrew_data
         shell: python
         run: |
+          import sys, os
+          sys.path.insert(0, os.getcwd())
           import spacy
           for model in ("en_core_web_sm", "xx_ent_wiki_sm"):
               try:
@@ -50,7 +52,9 @@ jobs:
       - name: Get spaCy model paths
         shell: python
         run: |
-          import spacy, os
+          import sys, os
+          sys.path.insert(0, os.getcwd())
+          import spacy
           en_path = str(spacy.util.get_package_path('en_core_web_sm'))
           xx_path = str(spacy.util.get_package_path('xx_ent_wiki_sm'))
           print(f"EN: {en_path}")
