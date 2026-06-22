@@ -446,15 +446,35 @@ class PIIEngine:
         if nlp_engine:
             return AnalyzerEngine(nlp_engine=nlp_engine, registry=registry, supported_languages=["he"])
         else:
+            # xx model unavailable — fall back to en_core_web_sm mapped to "he"
+            # We must register all custom recognizers as "en" to match the engine language
+            registry2 = RecognizerRegistry()
+            registry2.add_recognizer(IsraeliIdRecognizer(lang="en"))
+            registry2.add_recognizer(IsraeliPhoneRecognizer(lang="en"))
+            registry2.add_recognizer(HebrewDateRecognizer(lang="en"))
+            for rec_cls in (EmailRecognizer, IbanRecognizer, CreditCardRecognizer, UrlRecognizer, IpRecognizer):
+                try:
+                    registry2.add_recognizer(rec_cls(supported_language="en"))
+                except Exception:
+                    pass
+            try:
+                from presidio_analyzer.predefined_recognizers import PhoneRecognizer
+                try:
+                    registry2.add_recognizer(PhoneRecognizer(supported_language="en", supported_regions=["IL"]))
+                except Exception:
+                    registry2.add_recognizer(PhoneRecognizer(supported_language="en"))
+            except Exception:
+                pass
             provider = NlpEngineProvider(nlp_configuration={
                 "nlp_engine_name": "spacy",
-                "models": [{"lang_code": "he", "model_name": "en_core_web_sm"}],
+                "models": [{"lang_code": "en", "model_name": "en_core_web_sm"}],
             })
             try:
                 fallback_engine = provider.create_engine()
-                return AnalyzerEngine(nlp_engine=fallback_engine, registry=registry, supported_languages=["he"])
+                registry2.load_predefined_recognizers(nlp_engine=fallback_engine)
+                return AnalyzerEngine(nlp_engine=fallback_engine, registry=registry2, supported_languages=["en"])
             except Exception:
-                return AnalyzerEngine(registry=registry, supported_languages=["he"])
+                return self._en_analyzer  # last resort: reuse English analyzer
 
     @staticmethod
     def _map_entity(entity_type: str) -> str:
@@ -541,6 +561,74 @@ class PIIEngine:
         if self._xx_available:
             return "xx_ent_wiki_sm + dictionary (700+ names)"
         return "dictionary (700+ Israeli names)"
+
+
+# ---------------------------------------------------------------------------
+#  Custom PII project file helpers
+# ---------------------------------------------------------------------------
+
+CUSTOM_PII_FILENAME = "_custom_pii.json"
+
+def get_project_pii_path(folder: str) -> str:
+    """Return the path to the custom PII file for a given project folder."""
+    return os.path.join(folder, CUSTOM_PII_FILENAME)
+
+def load_project_pii(folder: str) -> List[dict]:
+    """
+    Load the project-level custom PII list from the folder.
+    Returns a list of dicts: [{"text": str, "label": str}, ...]
+    """
+    path = get_project_pii_path(folder)
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            if isinstance(data, list):
+                return data
+        except Exception:
+            pass
+    return []
+
+def save_project_pii(folder: str, entries: List[dict]) -> None:
+    """Save the project-level custom PII list to the folder."""
+    path = get_project_pii_path(folder)
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(entries, fh, indent=2, ensure_ascii=False)
+
+def apply_custom_pii(text: str, entries: List[dict],
+                     mapping: Dict[str, str],
+                     entity_counts: Dict[str, int],
+                     value_to_ph: Dict[str, str],
+                     detections: List[dict]) -> str:
+    """
+    Apply manual custom PII entries to the text (case-sensitive exact match).
+    Modifies mapping, entity_counts, value_to_ph, and detections in-place.
+    Returns the modified text.
+    """
+    for entry in entries:
+        raw = entry.get("text", "").strip()
+        label = entry.get("label", "CUSTOM").upper().replace(" ", "_")
+        if not raw:
+            continue
+        # Find all occurrences (longest first to avoid partial overlaps)
+        for m in sorted(re.finditer(re.escape(raw), text),
+                        key=lambda x: x.start(), reverse=True):
+            original = m.group()
+            if original in value_to_ph:
+                ph = value_to_ph[original]
+            else:
+                entity_counts[label] = entity_counts.get(label, 0) + 1
+                ph = f"{{{{{label}_{entity_counts[label]}}}}}"
+                mapping[ph] = original
+                value_to_ph[original] = ph
+            detections.append({
+                "placeholder": ph, "original": original,
+                "label": label, "score": 1.0,
+                "start": m.start(), "end": m.end(),
+                "lang": "custom",
+            })
+            text = text[:m.start()] + ph + text[m.end():]
+    return text
 
 
 # ---------------------------------------------------------------------------
@@ -718,14 +806,20 @@ class App(tk.Tk):
 
         self._tab_anon    = tk.Frame(nb, bg=DARK_BG)
         self._tab_restore = tk.Frame(nb, bg=DARK_BG)
+        self._tab_batch   = tk.Frame(nb, bg=DARK_BG)
+        self._tab_custom  = tk.Frame(nb, bg=DARK_BG)
         self._tab_about   = tk.Frame(nb, bg=DARK_BG)
 
-        nb.add(self._tab_anon,    text="  \U0001f512  Anonymize / Remove PII  ")
-        nb.add(self._tab_restore, text="  \U0001f513  Restore / Reinstate PII  ")
+        nb.add(self._tab_anon,    text="  \U0001f512  Anonymize  ")
+        nb.add(self._tab_restore, text="  \U0001f513  Restore  ")
+        nb.add(self._tab_batch,   text="  \U0001f4c2  Batch Folder  ")
+        nb.add(self._tab_custom,  text="  \u270f  Custom PII  ")
         nb.add(self._tab_about,   text="  \u2139  About  ")
 
         self._build_anonymize_tab()
         self._build_restore_tab()
+        self._build_batch_tab()
+        self._build_custom_pii_tab()
         self._build_about_tab()
 
         bar = tk.Frame(self, bg=PANEL_BG, height=28)
@@ -981,6 +1075,9 @@ class App(tk.Tk):
             self._anon_output.set(base + "_anonymized.txt")
             self._anon_map.set(base + "_mapping.json")
             self._load_preview(path, self._anon_txt_in)
+            # Auto-load project custom PII from the same folder
+            folder = os.path.dirname(path)
+            self._load_project_pii_into_editor(folder)
 
     def _browse_anon_out(self):
         path = filedialog.asksaveasfilename(title="Save anonymized document",
@@ -1111,12 +1208,28 @@ class App(tk.Tk):
         self._start_spinner("Anonymizing document...")
         self._set_status("Anonymizing...", WARNING)
 
+        # Collect custom PII entries from the project editor
+        custom_entries = self._get_custom_pii_entries()
+
         def task():
             try:
                 text = read_file(inp)
                 engine = PIIEngine.get()
                 anon_text, mapping, detections = engine.anonymize(
                     text, confidence=confidence, entities=selected_entities)
+                # Apply manual custom PII on top of NLP results
+                if custom_entries:
+                    entity_counts: Dict[str, int] = {}
+                    value_to_ph: Dict[str, str] = {ph: orig for ph, orig in mapping.items()}
+                    # Rebuild entity_counts from existing mapping
+                    for ph in mapping:
+                        m = re.match(r'\{\{([A-Z_]+)_(\d+)\}\}', ph)
+                        if m:
+                            lbl, num = m.group(1), int(m.group(2))
+                            entity_counts[lbl] = max(entity_counts.get(lbl, 0), num)
+                    anon_text = apply_custom_pii(
+                        anon_text, custom_entries,
+                        mapping, entity_counts, value_to_ph, detections)
                 write_file(out, anon_text)
                 with open(mapf, "w", encoding="utf-8") as fh:
                     json.dump(mapping, fh, indent=4, ensure_ascii=False)
@@ -1191,6 +1304,391 @@ class App(tk.Tk):
         self._stop_spinner()
         self._set_status(f"Error: {msg}", DANGER)
         messagebox.showerror("Error", msg)
+
+    # -----------------------------------------------------------------------
+    #  Custom PII tab
+    # -----------------------------------------------------------------------
+
+    def _build_custom_pii_tab(self):
+        tab = self._tab_custom
+        left = tk.Frame(tab, bg=DARK_BG, width=340)
+        left.pack(side="left", fill="y", padx=(12, 6), pady=12)
+        left.pack_propagate(False)
+        right = tk.Frame(tab, bg=DARK_BG)
+        right.pack(side="left", fill="both", expand=True, padx=(0, 12), pady=12)
+
+        panel = tk.Frame(left, bg=PANEL_BG)
+        panel.pack(fill="both", expand=True)
+
+        section_label(panel, "PROJECT FOLDER").pack(anchor="w", padx=14, pady=(14, 4))
+
+        self._custom_folder = tk.StringVar()
+        folder_row = tk.Frame(panel, bg=PANEL_BG)
+        folder_row.pack(fill="x", padx=14, pady=3)
+        tk.Label(folder_row, text="Project folder", bg=PANEL_BG, fg=TEXT_MAIN,
+                 font=("Segoe UI", 9), width=14, anchor="w").pack(side="left")
+        tk.Entry(folder_row, textvariable=self._custom_folder, bg=ENTRY_BG, fg=TEXT_MAIN,
+                 insertbackground=TEXT_MAIN, relief="flat", font=("Segoe UI", 9), bd=4
+                 ).pack(side="left", fill="x", expand=True)
+        tk.Button(folder_row, text="Browse", command=self._browse_custom_folder,
+                  bg=BORDER, fg=TEXT_MAIN, font=("Segoe UI", 8), relief="flat",
+                  cursor="hand2", padx=6).pack(side="left", padx=(4, 0))
+
+        self._custom_pii_path_lbl = tk.Label(panel, text="", bg=PANEL_BG, fg=TEXT_DIM,
+                                              font=("Segoe UI", 8), wraplength=300, justify="left")
+        self._custom_pii_path_lbl.pack(anchor="w", padx=14, pady=(2, 0))
+
+        tk.Frame(panel, bg=BORDER, height=1).pack(fill="x", padx=14, pady=10)
+        section_label(panel, "ADD NEW ENTRY").pack(anchor="w", padx=14, pady=(0, 6))
+
+        self._new_pii_text  = tk.StringVar()
+        self._new_pii_label = tk.StringVar(value="PERSON")
+
+        entry_row(panel, "Text to hide", self._new_pii_text).pack(fill="x", padx=14, pady=3)
+
+        lbl_row = tk.Frame(panel, bg=PANEL_BG)
+        lbl_row.pack(fill="x", padx=14, pady=3)
+        tk.Label(lbl_row, text="Entity label", bg=PANEL_BG, fg=TEXT_MAIN,
+                 font=("Segoe UI", 9), width=14, anchor="w").pack(side="left")
+        ttk.Combobox(lbl_row, textvariable=self._new_pii_label,
+                     values=["PERSON", "LOCATION", "ORGANIZATION", "IL_ID",
+                             "PHONE", "EMAIL", "DATE", "CUSTOM"],
+                     state="normal", width=16, font=("Segoe UI", 9)).pack(side="left")
+
+        styled_button(panel, "+ Add Entry", self._add_custom_pii_entry,
+                      bg=SUCCESS, fg=DARK_BG, width=20).pack(padx=14, pady=(8, 4))
+
+        tk.Frame(panel, bg=BORDER, height=1).pack(fill="x", padx=14, pady=8)
+
+        styled_button(panel, "\U0001f4be  Save to Project Folder", self._save_custom_pii,
+                      width=28).pack(padx=14, pady=(0, 4))
+        styled_button(panel, "\U0001f4c2  Load from Project Folder", self._load_custom_pii,
+                      bg=PANEL_BG, width=28).pack(padx=14, pady=(0, 14))
+
+        # Right side: list of current entries
+        section_label(right, "CURRENT CUSTOM PII ENTRIES").pack(anchor="w", padx=4, pady=(4, 6))
+
+        cols = ("Text to Hide", "Entity Label")
+        self._custom_tv = ttk.Treeview(right, columns=cols, show="headings", height=20)
+        style = ttk.Style()
+        style.configure("Treeview", background=ENTRY_BG, foreground=TEXT_MAIN,
+                         fieldbackground=ENTRY_BG, rowheight=24, font=("Consolas", 9))
+        for col in cols:
+            self._custom_tv.heading(col, text=col)
+            self._custom_tv.column(col, width=280 if col == "Text to Hide" else 160, anchor="w")
+        vsb = ttk.Scrollbar(right, orient="vertical", command=self._custom_tv.yview)
+        self._custom_tv.configure(yscrollcommand=vsb.set)
+        vsb.pack(side="right", fill="y")
+        self._custom_tv.pack(fill="both", expand=True)
+
+        btn_row = tk.Frame(right, bg=DARK_BG)
+        btn_row.pack(fill="x", pady=(6, 0))
+        tk.Button(btn_row, text="\u274c  Remove Selected", command=self._remove_custom_pii_entry,
+                  bg=DANGER, fg="white", font=("Segoe UI", 9, "bold"), relief="flat",
+                  cursor="hand2", padx=10, pady=6).pack(side="left")
+        tk.Button(btn_row, text="Clear All", command=self._clear_custom_pii,
+                  bg=BORDER, fg=TEXT_MAIN, font=("Segoe UI", 9), relief="flat",
+                  cursor="hand2", padx=10, pady=6).pack(side="left", padx=(8, 0))
+
+    def _browse_custom_folder(self):
+        folder = filedialog.askdirectory(title="Select project folder")
+        if folder:
+            self._custom_folder.set(folder)
+            pii_path = get_project_pii_path(folder)
+            self._custom_pii_path_lbl.config(
+                text=f"PII file: {pii_path}",
+                fg=SUCCESS if os.path.exists(pii_path) else TEXT_DIM)
+            # Auto-load if file exists
+            if os.path.exists(pii_path):
+                self._load_project_pii_into_editor(folder)
+
+    def _load_project_pii_into_editor(self, folder: str):
+        """Load the project custom PII file into the editor table."""
+        entries = load_project_pii(folder)
+        if entries:
+            self._custom_folder.set(folder)
+            pii_path = get_project_pii_path(folder)
+            self._custom_pii_path_lbl.config(
+                text=f"PII file: {pii_path}", fg=SUCCESS)
+            for row in self._custom_tv.get_children():
+                self._custom_tv.delete(row)
+            for e in entries:
+                self._custom_tv.insert("", "end", values=(e.get("text", ""), e.get("label", "CUSTOM")))
+
+    def _add_custom_pii_entry(self):
+        text  = self._new_pii_text.get().strip()
+        label = self._new_pii_label.get().strip().upper().replace(" ", "_") or "CUSTOM"
+        if not text:
+            messagebox.showwarning("Empty Entry", "Please enter the text you want to hide.")
+            return
+        # Check for duplicate
+        for row in self._custom_tv.get_children():
+            if self._custom_tv.item(row)["values"][0] == text:
+                messagebox.showinfo("Duplicate", f"'{text}' is already in the list.")
+                return
+        self._custom_tv.insert("", "end", values=(text, label))
+        self._new_pii_text.set("")
+
+    def _remove_custom_pii_entry(self):
+        selected = self._custom_tv.selection()
+        if not selected:
+            messagebox.showinfo("Nothing Selected", "Click a row to select it, then click Remove.")
+            return
+        for item in selected:
+            self._custom_tv.delete(item)
+
+    def _clear_custom_pii(self):
+        if messagebox.askyesno("Clear All", "Remove all custom PII entries from the list?"):
+            for row in self._custom_tv.get_children():
+                self._custom_tv.delete(row)
+
+    def _save_custom_pii(self):
+        folder = self._custom_folder.get().strip()
+        if not folder:
+            folder = filedialog.askdirectory(title="Select project folder to save custom PII")
+            if not folder:
+                return
+            self._custom_folder.set(folder)
+        entries = self._get_custom_pii_entries()
+        save_project_pii(folder, entries)
+        pii_path = get_project_pii_path(folder)
+        self._custom_pii_path_lbl.config(text=f"PII file: {pii_path}", fg=SUCCESS)
+        self._set_status(f"Custom PII saved to {pii_path}", SUCCESS)
+        messagebox.showinfo("Saved",
+            f"Custom PII list saved:\n{pii_path}\n\n"
+            f"{len(entries)} entries will be applied to all documents in this folder.")
+
+    def _load_custom_pii(self):
+        folder = self._custom_folder.get().strip()
+        if not folder:
+            folder = filedialog.askdirectory(title="Select project folder to load custom PII from")
+            if not folder:
+                return
+            self._custom_folder.set(folder)
+        pii_path = get_project_pii_path(folder)
+        if not os.path.exists(pii_path):
+            messagebox.showinfo("Not Found",
+                f"No custom PII file found in:\n{folder}\n\n"
+                f"(Expected: {CUSTOM_PII_FILENAME})")
+            return
+        self._load_project_pii_into_editor(folder)
+        self._set_status(f"Loaded {len(load_project_pii(folder))} custom entries from {folder}", SUCCESS)
+
+    def _get_custom_pii_entries(self) -> List[dict]:
+        """Read current entries from the custom PII treeview."""
+        entries = []
+        for row in self._custom_tv.get_children():
+            vals = self._custom_tv.item(row)["values"]
+            if vals and str(vals[0]).strip():
+                entries.append({"text": str(vals[0]), "label": str(vals[1])})
+        return entries
+
+    # -----------------------------------------------------------------------
+    #  Batch processing tab
+    # -----------------------------------------------------------------------
+
+    def _build_batch_tab(self):
+        tab = self._tab_batch
+        left = tk.Frame(tab, bg=DARK_BG, width=340)
+        left.pack(side="left", fill="y", padx=(12, 6), pady=12)
+        left.pack_propagate(False)
+        right = tk.Frame(tab, bg=DARK_BG)
+        right.pack(side="left", fill="both", expand=True, padx=(0, 12), pady=12)
+
+        panel = tk.Frame(left, bg=PANEL_BG)
+        panel.pack(fill="both", expand=True)
+
+        section_label(panel, "BATCH SETTINGS").pack(anchor="w", padx=14, pady=(14, 4))
+
+        self._batch_folder = tk.StringVar()
+        self._batch_out_folder = tk.StringVar()
+
+        for lbl, var, cmd in [
+            ("Source folder",  self._batch_folder,     self._browse_batch_folder),
+            ("Output folder",  self._batch_out_folder, self._browse_batch_out_folder),
+        ]:
+            entry_row(panel, lbl, var, cmd).pack(fill="x", padx=14, pady=3)
+
+        self._batch_custom_lbl = tk.Label(panel, text="", bg=PANEL_BG, fg=TEXT_DIM,
+                                           font=("Segoe UI", 8), wraplength=300, justify="left")
+        self._batch_custom_lbl.pack(anchor="w", padx=14, pady=(2, 0))
+
+        tk.Frame(panel, bg=BORDER, height=1).pack(fill="x", padx=14, pady=10)
+        section_label(panel, "DETECTION SETTINGS").pack(anchor="w", padx=14, pady=(0, 6))
+
+        conf_row = tk.Frame(panel, bg=PANEL_BG)
+        conf_row.pack(fill="x", padx=14, pady=(0, 4))
+        tk.Label(conf_row, text="Min. confidence", bg=PANEL_BG, fg=TEXT_MAIN,
+                 font=("Segoe UI", 9), width=18, anchor="w").pack(side="left")
+        self._batch_confidence = tk.DoubleVar(value=DEFAULT_CONFIDENCE)
+        tk.Scale(conf_row, from_=0.3, to=1.0, resolution=0.05, orient="horizontal",
+                 variable=self._batch_confidence, bg=PANEL_BG, fg=TEXT_MAIN,
+                 troughcolor=ENTRY_BG, highlightthickness=0,
+                 font=("Segoe UI", 8), activebackground=ACCENT, length=120
+                 ).pack(side="left")
+        self._batch_conf_lbl = tk.Label(conf_row, text=f"{DEFAULT_CONFIDENCE:.2f}",
+                                         bg=PANEL_BG, fg=ACCENT, font=("Segoe UI", 9, "bold"), width=4)
+        self._batch_conf_lbl.pack(side="left")
+        self._batch_confidence.trace_add("write",
+            lambda *_: self._batch_conf_lbl.config(text=f"{self._batch_confidence.get():.2f}"))
+
+        tk.Frame(panel, bg=BORDER, height=1).pack(fill="x", padx=14, pady=10)
+
+        info_box = tk.Frame(panel, bg=ENTRY_BG)
+        info_box.pack(fill="x", padx=14, pady=(0, 10))
+        tk.Label(info_box,
+                 text="Batch mode processes every .txt, .docx, and .pdf\n"
+                      "file in the source folder.\n\n"
+                      "Each file gets its own anonymized output and\n"
+                      "mapping file in the output folder.\n\n"
+                      "If a _custom_pii.json file exists in the source\n"
+                      "folder, it is automatically applied to all files.",
+                 bg=ENTRY_BG, fg=TEXT_DIM, font=("Segoe UI", 9),
+                 justify="left", padx=12, pady=10).pack()
+
+        styled_button(panel, "\U0001f4c2  Run Batch Anonymize", self._run_batch,
+                      width=28).pack(padx=14, pady=(0, 14))
+
+        # Right: log output
+        section_label(right, "BATCH LOG").pack(anchor="w", padx=4, pady=(4, 6))
+        self._batch_log = scrolledtext.ScrolledText(
+            right, bg=ENTRY_BG, fg=TEXT_MAIN, insertbackground=TEXT_MAIN,
+            font=("Consolas", 9), relief="flat", wrap="word",
+            selectbackground=ACCENT, selectforeground="white", state="disabled")
+        self._batch_log.pack(fill="both", expand=True)
+        self._batch_log.tag_configure("ok",    foreground=SUCCESS)
+        self._batch_log.tag_configure("err",   foreground=DANGER)
+        self._batch_log.tag_configure("info",  foreground=ACCENT)
+        self._batch_log.tag_configure("warn",  foreground=WARNING)
+
+    def _browse_batch_folder(self):
+        folder = filedialog.askdirectory(title="Select source folder")
+        if folder:
+            self._batch_folder.set(folder)
+            # Auto-set output folder to a subfolder
+            self._batch_out_folder.set(os.path.join(folder, "anonymized"))
+            # Check for project custom PII
+            pii_path = get_project_pii_path(folder)
+            if os.path.exists(pii_path):
+                entries = load_project_pii(folder)
+                self._batch_custom_lbl.config(
+                    text=f"\u2714 Custom PII loaded: {len(entries)} entries from {CUSTOM_PII_FILENAME}",
+                    fg=SUCCESS)
+                # Also sync to the custom PII editor
+                self._load_project_pii_into_editor(folder)
+            else:
+                self._batch_custom_lbl.config(
+                    text=f"No {CUSTOM_PII_FILENAME} found — using NLP only",
+                    fg=TEXT_DIM)
+
+    def _browse_batch_out_folder(self):
+        folder = filedialog.askdirectory(title="Select output folder")
+        if folder:
+            self._batch_out_folder.set(folder)
+
+    def _batch_log_write(self, msg: str, tag: str = ""):
+        self._batch_log.config(state="normal")
+        self._batch_log.insert("end", msg + "\n", tag)
+        self._batch_log.see("end")
+        self._batch_log.config(state="disabled")
+
+    def _run_batch(self):
+        if not self._engine_ready:
+            messagebox.showwarning("Engine Loading", "Please wait for the NLP engine to finish loading.")
+            return
+        src = self._batch_folder.get().strip()
+        out = self._batch_out_folder.get().strip()
+        if not src or not os.path.isdir(src):
+            messagebox.showwarning("Missing Folder", "Please select a valid source folder.")
+            return
+        if not out:
+            messagebox.showwarning("Missing Output", "Please specify an output folder.")
+            return
+
+        # Collect files
+        exts = (".txt", ".docx", ".pdf")
+        files = [f for f in os.listdir(src)
+                 if os.path.splitext(f)[1].lower() in exts
+                 and not f.startswith("_")]
+        if not files:
+            messagebox.showinfo("No Files", f"No .txt, .docx, or .pdf files found in:\n{src}")
+            return
+
+        confidence = self._batch_confidence.get()
+        custom_entries = self._get_custom_pii_entries()
+        # Also check for project-level custom PII in the source folder
+        folder_entries = load_project_pii(src)
+        all_custom = {e["text"]: e for e in (folder_entries + custom_entries)}
+        merged_custom = list(all_custom.values())
+
+        os.makedirs(out, exist_ok=True)
+
+        # Clear log
+        self._batch_log.config(state="normal")
+        self._batch_log.delete("1.0", "end")
+        self._batch_log.config(state="disabled")
+
+        self._batch_log_write(f"Batch anonymize: {len(files)} file(s) in {src}", "info")
+        if merged_custom:
+            self._batch_log_write(f"Custom PII entries: {len(merged_custom)}", "info")
+        self._batch_log_write("", "")
+
+        self._start_spinner(f"Batch processing {len(files)} files...")
+        self._set_status(f"Batch processing {len(files)} files...", WARNING)
+
+        def task():
+            ok = 0
+            fail = 0
+            for fname in files:
+                fpath = os.path.join(src, fname)
+                base  = os.path.splitext(fname)[0]
+                out_path = os.path.join(out, base + "_anonymized.txt")
+                map_path = os.path.join(out, base + "_mapping.json")
+                try:
+                    text = read_file(fpath)
+                    engine = PIIEngine.get()
+                    anon_text, mapping, detections = engine.anonymize(
+                        text, confidence=confidence)
+                    if merged_custom:
+                        entity_counts: Dict[str, int] = {}
+                        value_to_ph: Dict[str, str] = {ph: orig for ph, orig in mapping.items()}
+                        for ph in mapping:
+                            m2 = re.match(r'\{\{([A-Z_]+)_(\d+)\}\}', ph)
+                            if m2:
+                                lbl2, num2 = m2.group(1), int(m2.group(2))
+                                entity_counts[lbl2] = max(entity_counts.get(lbl2, 0), num2)
+                        anon_text = apply_custom_pii(
+                            anon_text, merged_custom,
+                            mapping, entity_counts, value_to_ph, detections)
+                    write_file(out_path, anon_text)
+                    with open(map_path, "w", encoding="utf-8") as fh:
+                        json.dump(mapping, fh, indent=4, ensure_ascii=False)
+                    n = len(mapping)
+                    self.after(0, lambda fn=fname, n=n:
+                        self._batch_log_write(f"  \u2714  {fn}  →  {n} PII items replaced", "ok"))
+                    ok += 1
+                except Exception as exc:
+                    self.after(0, lambda fn=fname, e=str(exc):
+                        self._batch_log_write(f"  \u2718  {fn}  —  ERROR: {e}", "err"))
+                    fail += 1
+
+            def done():
+                self._stop_spinner()
+                self._batch_log_write("", "")
+                self._batch_log_write(
+                    f"Batch complete: {ok} succeeded, {fail} failed.", "info")
+                self._batch_log_write(f"Output folder: {out}", "info")
+                self._set_status(
+                    f"Batch done: {ok} succeeded, {fail} failed.",
+                    SUCCESS if fail == 0 else WARNING)
+                messagebox.showinfo("Batch Complete",
+                    f"Batch anonymization complete!\n\n"
+                    f"  Succeeded : {ok}\n"
+                    f"  Failed    : {fail}\n\n"
+                    f"Output folder:\n  {out}")
+            self.after(0, done)
+
+        threading.Thread(target=task, daemon=True).start()
 
 
 # ---------------------------------------------------------------------------
