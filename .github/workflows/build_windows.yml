@@ -1,4 +1,4 @@
-name: Build Windows EXE (Hebrew + English v3.0)
+name: Build Windows EXE (Hebrew + English v4.0 - onefile)
 
 on:
   push:
@@ -63,12 +63,12 @@ jobs:
               f.write(f"EN_MODEL_PATH={en_path}\n")
               f.write(f"XX_MODEL_PATH={xx_path}\n")
 
-      - name: Build with PyInstaller
+      - name: Build single-file Windows executable with PyInstaller
         shell: cmd
         run: |
           python -m PyInstaller ^
             --name PII_Processor ^
-            --onedir ^
+            --onefile ^
             --windowed ^
             --noconfirm ^
             --add-data "%EN_MODEL_PATH%;en_core_web_sm" ^
@@ -129,16 +129,21 @@ jobs:
             --collect-all phonenumbers ^
             pii_processor_gui.py
 
-      - name: Verify build size
+      - name: Verify build output
         shell: powershell
         run: |
-          $size = (Get-ChildItem -Path dist\PII_Processor -Recurse | Measure-Object -Property Length -Sum).Sum / 1MB
-          Write-Host "Build size: $([math]::Round($size, 1)) MB"
-          dir dist\PII_Processor
+          $exe = "dist\PII_Processor.exe"
+          if (Test-Path $exe) {
+            $size = (Get-Item $exe).Length / 1MB
+            Write-Host "SUCCESS: PII_Processor.exe built ($([math]::Round($size, 1)) MB)"
+          } else {
+            Write-Host "ERROR: PII_Processor.exe not found"
+            exit 1
+          }
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: PII_Processor_Windows_Hebrew_v3
-          path: dist/PII_Processor/
+          name: PII_Processor_Windows_v4_onefile
+          path: dist/PII_Processor.exe
           retention-days: 7

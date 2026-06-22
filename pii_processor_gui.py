@@ -579,6 +579,72 @@ def entry_row(parent, label_text, var, browse_cmd=None):
 
 
 # ---------------------------------------------------------------------------
+#  Splash screen
+# ---------------------------------------------------------------------------
+
+class SplashScreen(tk.Toplevel):
+    """Full-window splash shown while the NLP engine loads."""
+
+    def __init__(self, master):
+        super().__init__(master)
+        self.overrideredirect(True)          # borderless
+        self.configure(bg=DARK_BG)
+        self.attributes("-topmost", True)
+
+        # Centre on screen
+        w, h = 520, 320
+        sw = self.winfo_screenwidth()
+        sh = self.winfo_screenheight()
+        x = (sw - w) // 2
+        y = (sh - h) // 2
+        self.geometry(f"{w}x{h}+{x}+{y}")
+
+        # Logo / title
+        tk.Label(
+            self, text="⚖️  Legal PII Anonymizer",
+            bg=DARK_BG, fg=TEXT_MAIN,
+            font=("Segoe UI", 20, "bold"),
+        ).pack(pady=(48, 4))
+
+        tk.Label(
+            self, text="Hebrew \u2022 English  |  v3.0",
+            bg=DARK_BG, fg=ACCENT,
+            font=("Segoe UI", 11),
+        ).pack(pady=(0, 32))
+
+        # Animated progress bar
+        self._bar = ttk.Progressbar(
+            self, mode="indeterminate", length=380
+        )
+        self._bar.pack(pady=(0, 16))
+        self._bar.start(12)
+
+        # Status label
+        self._lbl = tk.Label(
+            self, text="Initialising NLP engine — please wait...",
+            bg=DARK_BG, fg=TEXT_DIM,
+            font=("Segoe UI", 9),
+            wraplength=460,
+        )
+        self._lbl.pack()
+
+        tk.Label(
+            self,
+            text="(First launch may take 10\u201330 seconds while Windows caches the application)",
+            bg=DARK_BG, fg=TEXT_DIM,
+            font=("Segoe UI", 8),
+            wraplength=460,
+        ).pack(pady=(8, 0))
+
+    def set_status(self, msg: str):
+        self._lbl.config(text=msg)
+
+    def close(self):
+        self._bar.stop()
+        self.destroy()
+
+
+# ---------------------------------------------------------------------------
 #  Main Application Window
 # ---------------------------------------------------------------------------
 
@@ -590,6 +656,12 @@ class App(tk.Tk):
         self.minsize(900, 640)
         self.configure(bg=DARK_BG)
         self._engine_ready = False
+
+        # Show splash immediately, hide main window until engine is ready
+        self.withdraw()
+        self._splash = SplashScreen(self)
+        self.update()
+
         self._build_ui()
         self._load_engine_async()
 
@@ -599,14 +671,30 @@ class App(tk.Tk):
 
     def _load_engine(self):
         try:
+            self.after(0, lambda: self._splash.set_status(
+                "Loading English NLP model (en_core_web_sm)..."
+            ))
             engine = PIIEngine.get()
             self._engine_ready = True
             model_info = engine.hebrew_ner_model
             msg = f"Engine ready — Hebrew: {model_info}"
+            self.after(0, lambda: self._splash.set_status("Engine ready! Opening application..."))
+            self.after(300, self._show_main)
             self.after(0, lambda: self._set_status(msg, SUCCESS))
             self.after(0, lambda: self._lang_lbl.config(text=f"EN + HE ({model_info})", fg=SUCCESS))
         except Exception as exc:
+            self.after(0, lambda: self._splash.set_status(f"Error: {exc}"))
             self.after(0, lambda: self._set_status(f"Engine error: {exc}", DANGER))
+            self.after(1500, self._show_main)
+
+    def _show_main(self):
+        """Close splash and reveal the main window."""
+        try:
+            self._splash.close()
+        except Exception:
+            pass
+        self.deiconify()
+        self.lift()
 
     def _build_ui(self):
         header = tk.Frame(self, bg=PANEL_BG, pady=14)
