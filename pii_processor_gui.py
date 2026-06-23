@@ -27,6 +27,20 @@ import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox, scrolledtext, ttk
 from typing import Dict, List, Optional, Tuple
+import urllib.request
+import urllib.error
+import tempfile
+import shutil
+import subprocess
+
+# ---------------------------------------------------------------------------
+#  Version — bump this for every release
+# ---------------------------------------------------------------------------
+APP_VERSION = "5.1"
+UPDATE_MANIFEST_URL = (
+    "https://github.com/17Shaun01/pii-processor-build/"
+    "releases/latest/download/version.json"
+)
 
 try:
     from presidio_analyzer import (
@@ -702,6 +716,208 @@ def entry_row(parent, label_text, var, browse_cmd=None):
 #  Splash screen
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+#  Auto-Updater
+# ---------------------------------------------------------------------------
+
+class Updater:
+    """
+    Checks GitHub Releases for a newer version of the app.
+    Runs entirely in background threads so the UI is never blocked.
+
+    Flow:
+      1. On startup, check_in_background() fetches version.json from the
+         latest GitHub Release.
+      2. If a newer version is found, it calls on_update_available(info)
+         on the main thread via tk.after().
+      3. The App shows a non-intrusive banner with a "Download & Restart" button.
+      4. download_and_restart() streams the new .exe, replaces the current
+         executable, and relaunches the process.
+    """
+
+    def __init__(self, app: "App"):
+        self._app = app
+        self._banner_frame: Optional[tk.Frame] = None
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def check_in_background(self):
+        """Spawn a daemon thread to check for updates silently."""
+        threading.Thread(target=self._check, daemon=True).start()
+
+    def download_and_restart(self, download_url: str, new_version: str):
+        """Show a progress dialog and replace the running .exe."""
+        dlg = _UpdateDownloadDialog(self._app, new_version)
+        threading.Thread(
+            target=self._do_download,
+            args=(download_url, new_version, dlg),
+            daemon=True,
+        ).start()
+
+    # ------------------------------------------------------------------
+    # Internal
+    # ------------------------------------------------------------------
+
+    def _check(self):
+        try:
+            req = urllib.request.Request(
+                UPDATE_MANIFEST_URL,
+                headers={"User-Agent": f"PII-Processor/{APP_VERSION}"},
+            )
+            with urllib.request.urlopen(req, timeout=8) as resp:
+                data = json.loads(resp.read().decode())
+            latest = data.get("version", "")
+            url    = data.get("download_url", "")
+            notes  = data.get("release_notes", "")
+            if latest and url and self._is_newer(latest):
+                self._app.after(0, lambda: self._on_update_available(
+                    latest, url, notes
+                ))
+        except Exception:
+            pass  # silently ignore network errors
+
+    @staticmethod
+    def _is_newer(remote: str) -> bool:
+        """Return True if remote version string is greater than APP_VERSION."""
+        def _parts(v):
+            try:
+                return tuple(int(x) for x in str(v).split("."))
+            except Exception:
+                return (0,)
+        return _parts(remote) > _parts(APP_VERSION)
+
+    def _on_update_available(self, version: str, url: str, notes: str):
+        """Show the update banner in the app header."""
+        if self._banner_frame:
+            return  # already shown
+        hdr = self._app._header_frame
+        self._banner_frame = tk.Frame(hdr, bg="#2a6a2a", padx=8, pady=4)
+        self._banner_frame.pack(side="right", padx=(0, 8))
+
+        tk.Label(
+            self._banner_frame,
+            text=f"\u2b06  Update available  v{version}",
+            bg="#2a6a2a", fg="#90ee90",
+            font=("Segoe UI", 9, "bold"),
+        ).pack(side="left", padx=(0, 8))
+
+        tk.Button(
+            self._banner_frame,
+            text="Download & Restart",
+            bg="#3cb371", fg="white",
+            font=("Segoe UI", 9, "bold"),
+            relief="flat", cursor="hand2", padx=8,
+            command=lambda: self.download_and_restart(url, version),
+        ).pack(side="left")
+
+        if notes:
+            tk.Label(
+                self._banner_frame,
+                text=f"({notes})",
+                bg="#2a6a2a", fg="#90ee90",
+                font=("Segoe UI", 8),
+            ).pack(side="left", padx=(6, 0))
+
+    def _do_download(self, url: str, version: str, dlg: "_UpdateDownloadDialog"):
+        """Download the new .exe and replace the current one, then restart."""
+        try:
+            # Determine the path of the running executable
+            if getattr(sys, "frozen", False):
+                current_exe = sys.executable
+            else:
+                current_exe = os.path.abspath(sys.argv[0])
+
+            # Download to a temp file next to the current exe
+            exe_dir = os.path.dirname(current_exe)
+            tmp_path = os.path.join(exe_dir, f"_update_{version}.exe")
+
+            req = urllib.request.Request(
+                url,
+                headers={"User-Agent": f"PII-Processor/{APP_VERSION}"},
+            )
+            with urllib.request.urlopen(req, timeout=120) as resp:
+                total = int(resp.headers.get("Content-Length", 0))
+                downloaded = 0
+                chunk = 65536
+                with open(tmp_path, "wb") as f:
+                    while True:
+                        buf = resp.read(chunk)
+                        if not buf:
+                            break
+                        f.write(buf)
+                        downloaded += len(buf)
+                        if total > 0:
+                            pct = int(downloaded * 100 / total)
+                            self._app.after(0, lambda p=pct: dlg.set_progress(p))
+
+            # Rename current exe to .bak, rename new exe to current name
+            backup = current_exe + ".bak"
+            if os.path.exists(backup):
+                os.remove(backup)
+            os.rename(current_exe, backup)
+            os.rename(tmp_path, current_exe)
+
+            # Relaunch and exit
+            self._app.after(0, lambda: dlg.set_status("Restarting..."))
+            self._app.after(500, lambda: self._restart(current_exe))
+
+        except Exception as exc:
+            self._app.after(0, lambda: dlg.destroy())
+            self._app.after(
+                0,
+                lambda: messagebox.showerror(
+                    "Update Failed",
+                    f"Could not download update:\n{exc}\n\n"
+                    "Please download the latest version manually from GitHub.",
+                ),
+            )
+
+    @staticmethod
+    def _restart(exe_path: str):
+        subprocess.Popen([exe_path])
+        sys.exit(0)
+
+
+class _UpdateDownloadDialog(tk.Toplevel):
+    """Modal-ish progress window shown while downloading an update."""
+
+    def __init__(self, parent, version: str):
+        super().__init__(parent)
+        self.title("Downloading Update")
+        self.geometry("400x140")
+        self.resizable(False, False)
+        self.configure(bg="#1e1e2e")
+        self.grab_set()
+
+        tk.Label(
+            self,
+            text=f"Downloading PII Processor v{version}...",
+            bg="#1e1e2e", fg="#cdd6f4",
+            font=("Segoe UI", 11, "bold"),
+        ).pack(pady=(24, 8))
+
+        self._bar = ttk.Progressbar(self, length=340, maximum=100)
+        self._bar.pack(pady=4)
+
+        self._lbl = tk.Label(
+            self, text="0%",
+            bg="#1e1e2e", fg="#a6adc8",
+            font=("Segoe UI", 9),
+        )
+        self._lbl.pack()
+
+    def set_progress(self, pct: int):
+        self._bar["value"] = pct
+        self._lbl.config(text=f"{pct}%")
+        self.update_idletasks()
+
+    def set_status(self, msg: str):
+        self._lbl.config(text=msg)
+        self.update_idletasks()
+
+
 class SplashScreen(tk.Toplevel):
     """Full-window splash shown while the NLP engine loads."""
 
@@ -771,11 +987,12 @@ class SplashScreen(tk.Toplevel):
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("Legal Document PII Anonymizer  |  Hebrew / English  v3.0")
+        self.title(f"Legal Document PII Anonymizer  |  Hebrew / English  v{APP_VERSION}")
         self.geometry("1150x820")
         self.minsize(900, 640)
         self.configure(bg=DARK_BG)
         self._engine_ready = False
+        self._updater = Updater(self)
 
         # Show splash immediately, hide main window until engine is ready
         self.withdraw()
@@ -808,18 +1025,21 @@ class App(tk.Tk):
             self.after(1500, self._show_main)
 
     def _show_main(self):
-        """Close splash and reveal the main window."""
+        """Close splash, reveal the main window, then check for updates."""
         try:
             self._splash.close()
         except Exception:
             pass
         self.deiconify()
         self.lift()
+        # Check for updates silently in the background after the window is shown
+        self.after(2000, self._updater.check_in_background)
 
     def _build_ui(self):
         header = tk.Frame(self, bg=PANEL_BG, pady=14)
         header.pack(fill="x")
-        tk.Label(header, text="Legal Document PII Anonymizer & Restorer  v3.0",
+        self._header_frame = header  # Updater needs this reference
+        tk.Label(header, text=f"Legal Document PII Anonymizer & Restorer  v{APP_VERSION}",
                  bg=PANEL_BG, fg=TEXT_MAIN, font=("Segoe UI", 14, "bold")).pack(side="left", padx=20)
         self._lang_lbl = tk.Label(header, text="Loading...", bg=PANEL_BG, fg=WARNING, font=("Segoe UI", 9))
         self._lang_lbl.pack(side="right", padx=20)
@@ -1004,10 +1224,25 @@ class App(tk.Tk):
         frame = tk.Frame(tab, bg=DARK_BG)
         frame.pack(expand=True)
 
-        tk.Label(frame, text="Legal Document PII Anonymizer & Restorer  v3.0",
+        tk.Label(frame, text=f"Legal Document PII Anonymizer & Restorer  v{APP_VERSION}",
                  bg=DARK_BG, fg=TEXT_MAIN, font=("Segoe UI", 16, "bold")).pack(pady=(40, 0))
         tk.Label(frame, text="Protect attorney-client privilege before using cloud AI",
-                 bg=DARK_BG, fg=TEXT_DIM, font=("Segoe UI", 10)).pack(pady=(4, 24))
+                 bg=DARK_BG, fg=TEXT_DIM, font=("Segoe UI", 10)).pack(pady=(4, 8))
+
+        # Check for updates button
+        update_row = tk.Frame(frame, bg=DARK_BG)
+        update_row.pack(pady=(0, 16))
+        self._update_status_lbl = tk.Label(
+            update_row, text=f"Version {APP_VERSION}  \u2014  click to check for updates",
+            bg=DARK_BG, fg=TEXT_DIM, font=("Segoe UI", 9)
+        )
+        self._update_status_lbl.pack(side="left", padx=(0, 12))
+        tk.Button(
+            update_row, text="\u21ba  Check for Updates",
+            bg=PANEL_BG, fg=TEXT_MAIN, font=("Segoe UI", 9),
+            relief="flat", cursor="hand2", padx=10,
+            command=self._manual_check_update,
+        ).pack(side="left")
 
         info = [
             ("Engine",      "Microsoft Presidio + spaCy (en_core_web_sm + xx_ent_wiki_sm)"),
@@ -1331,6 +1566,45 @@ class App(tk.Tk):
             f"Restoration complete!\n\n"
             f"  Placeholders restored : {len(mapping)}\n\n"
             f"Restored document saved to:\n  {out}")
+
+    def _manual_check_update(self):
+        """Called when the user clicks 'Check for Updates' in the About tab."""
+        self._update_status_lbl.config(text="Checking for updates...", fg=WARNING)
+
+        def _check():
+            try:
+                req = urllib.request.Request(
+                    UPDATE_MANIFEST_URL,
+                    headers={"User-Agent": f"PII-Processor/{APP_VERSION}"},
+                )
+                with urllib.request.urlopen(req, timeout=8) as resp:
+                    data = json.loads(resp.read().decode())
+                latest  = data.get("version", "")
+                url     = data.get("download_url", "")
+                notes   = data.get("release_notes", "")
+                if latest and url and Updater._is_newer(latest):
+                    self.after(0, lambda: self._update_status_lbl.config(
+                        text=f"\u2b06 Update available: v{latest}  ({notes})",
+                        fg=SUCCESS,
+                    ))
+                    self.after(0, lambda: self._updater._on_update_available(
+                        latest, url, notes
+                    ))
+                elif latest:
+                    self.after(0, lambda: self._update_status_lbl.config(
+                        text=f"\u2714 You are on the latest version (v{APP_VERSION})",
+                        fg=SUCCESS,
+                    ))
+                else:
+                    self.after(0, lambda: self._update_status_lbl.config(
+                        text="Could not read version manifest", fg=DANGER
+                    ))
+            except Exception as exc:
+                self.after(0, lambda: self._update_status_lbl.config(
+                    text=f"Update check failed: {exc}", fg=DANGER
+                ))
+
+        threading.Thread(target=_check, daemon=True).start()
 
     def _on_error(self, msg: str):
         self._stop_spinner()

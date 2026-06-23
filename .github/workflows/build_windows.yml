@@ -1,23 +1,35 @@
-name: Build Windows EXE (Hebrew + English v4.0 - onefile)
+name: Build Windows Executable & Release
 
 on:
   push:
     branches: [ main ]
   workflow_dispatch:
 
+permissions:
+  contents: write   # needed to create releases and upload assets
+
 jobs:
   build:
     runs-on: windows-latest
 
     steps:
-      - name: Checkout code
+      # ----------------------------------------------------------------
+      # 1. Checkout
+      # ----------------------------------------------------------------
+      - name: Checkout repository
         uses: actions/checkout@v4
 
+      # ----------------------------------------------------------------
+      # 2. Set up Python
+      # ----------------------------------------------------------------
       - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
+      # ----------------------------------------------------------------
+      # 3. Install dependencies
+      # ----------------------------------------------------------------
       - name: Upgrade pip
         run: python -m pip install --upgrade pip
 
@@ -28,12 +40,18 @@ jobs:
           pip install spacy
           pip install python-docx "pdfminer.six" pyinstaller
 
+      # ----------------------------------------------------------------
+      # 4. Download spaCy models
+      # ----------------------------------------------------------------
       - name: Download English spaCy model
         run: python -m spacy download en_core_web_sm
 
       - name: Download multilingual spaCy model (Hebrew NER)
         run: python -m spacy download xx_ent_wiki_sm
 
+      # ----------------------------------------------------------------
+      # 5. Verify models and hebrew_data
+      # ----------------------------------------------------------------
       - name: Verify models and hebrew_data
         shell: python
         run: |
@@ -49,6 +67,9 @@ jobs:
           from hebrew_data import HEBREW_FIRST_NAMES, HEBREW_LAST_NAMES, HEBREW_LOCATIONS
           print(f"Hebrew dict: {len(HEBREW_FIRST_NAMES)} first names, {len(HEBREW_LAST_NAMES)} last names, {len(HEBREW_LOCATIONS)} locations")
 
+      # ----------------------------------------------------------------
+      # 6. Get spaCy model paths
+      # ----------------------------------------------------------------
       - name: Get spaCy model paths
         shell: python
         run: |
@@ -63,6 +84,24 @@ jobs:
               f.write(f"EN_MODEL_PATH={en_path}\n")
               f.write(f"XX_MODEL_PATH={xx_path}\n")
 
+      # ----------------------------------------------------------------
+      # 7. Extract APP_VERSION from source
+      # ----------------------------------------------------------------
+      - name: Extract APP_VERSION
+        id: get_version
+        shell: python
+        run: |
+          import re, os
+          src = open("pii_processor_gui.py", encoding="utf-8").read()
+          m = re.search(r'^APP_VERSION\s*=\s*["\']([^"\']+)["\']', src, re.M)
+          version = m.group(1) if m else "0.0"
+          print(f"APP_VERSION = {version}")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"version={version}\n")
+
+      # ----------------------------------------------------------------
+      # 8. Build single-file Windows executable with PyInstaller
+      # ----------------------------------------------------------------
       - name: Build single-file Windows executable with PyInstaller
         shell: cmd
         run: |
@@ -82,6 +121,7 @@ jobs:
             --hidden-import presidio_analyzer.predefined_recognizers.iban_recognizer ^
             --hidden-import presidio_analyzer.predefined_recognizers.credit_card_recognizer ^
             --hidden-import presidio_analyzer.predefined_recognizers.url_recognizer ^
+            --hidden-import presidio_analyzer.predefined_recognizers.spacy_recognizer ^
             --hidden-import presidio_analyzer.nlp_engine ^
             --hidden-import presidio_analyzer.nlp_engine.spacy_nlp_engine ^
             --hidden-import presidio_anonymizer ^
@@ -118,6 +158,8 @@ jobs:
             --hidden-import numpy.core ^
             --hidden-import numpy.core._methods ^
             --hidden-import numpy.lib.format ^
+            --hidden-import urllib.request ^
+            --hidden-import urllib.error ^
             --collect-all spacy ^
             --collect-all en_core_web_sm ^
             --collect-all xx_ent_wiki_sm ^
@@ -129,6 +171,9 @@ jobs:
             --collect-all phonenumbers ^
             pii_processor_gui.py
 
+      # ----------------------------------------------------------------
+      # 9. Verify build output
+      # ----------------------------------------------------------------
       - name: Verify build output
         shell: powershell
         run: |
@@ -141,9 +186,67 @@ jobs:
             exit 1
           }
 
+      # ----------------------------------------------------------------
+      # 10. Create version.json manifest
+      # ----------------------------------------------------------------
+      - name: Create version.json manifest
+        shell: python
+        run: |
+          import json, os
+          version = "${{ steps.get_version.outputs.version }}"
+          repo    = "${{ github.repository }}"
+          manifest = {
+              "version": version,
+              "download_url": (
+                  f"https://github.com/{repo}/releases/latest/download/PII_Processor.exe"
+              ),
+              "release_notes": f"Bug fixes and improvements",
+              "min_version":   "1.0",
+          }
+          with open("dist/version.json", "w") as f:
+              json.dump(manifest, f, indent=2)
+          print(json.dumps(manifest, indent=2))
+
+      # ----------------------------------------------------------------
+      # 11. Upload artifact (for manual download if needed)
+      # ----------------------------------------------------------------
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: PII_Processor_Windows_v4_onefile
-          path: dist/PII_Processor.exe
-          retention-days: 7
+          name: PII_Processor_Windows_v${{ steps.get_version.outputs.version }}
+          path: |
+            dist/PII_Processor.exe
+            dist/version.json
+          retention-days: 30
+
+      # ----------------------------------------------------------------
+      # 12. Create / update GitHub Release
+      #     The softprops action creates the tag + release automatically
+      # ----------------------------------------------------------------
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.get_version.outputs.version }}
+          name: "PII Processor v${{ steps.get_version.outputs.version }}"
+          body: |
+            ## PII Processor v${{ steps.get_version.outputs.version }}
+
+            ### What's included
+            - Full Hebrew + English PII detection (Israeli ID, phone, IBAN, dates)
+            - Batch folder processing
+            - Custom PII project lists (saved per matter folder)
+            - In-app auto-updater — future updates install with one click
+            - Engine fix: no more "misconfigured engine" error on Hebrew documents
+
+            ### How to install
+            1. Download `PII_Processor.exe` below
+            2. Double-click to run — no installation required
+            3. Keep the `.exe` in a **writable folder** so future updates can replace it automatically
+
+            ### How updates work
+            The app checks for updates silently on startup. When a new version is available, a green banner appears in the header. Click **Download & Restart** and the update installs automatically.
+          files: |
+            dist/PII_Processor.exe
+            dist/version.json
+          make_latest: true
+          token: ${{ secrets.GITHUB_TOKEN }}
