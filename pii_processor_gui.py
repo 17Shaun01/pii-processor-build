@@ -20,6 +20,8 @@
 """
 
 import json
+import logging
+import logging.handlers
 import os
 import re
 import sys
@@ -32,15 +34,97 @@ import urllib.error
 import tempfile
 import shutil
 import subprocess
+import datetime
 
 # ---------------------------------------------------------------------------
 #  Version — bump this for every release
 # ---------------------------------------------------------------------------
-APP_VERSION = "5.1"
+APP_VERSION = "5.2"
 UPDATE_MANIFEST_URL = (
     "https://github.com/17Shaun01/pii-processor-build/"
     "releases/latest/download/version.json"
 )
+
+# ---------------------------------------------------------------------------
+#  Logging setup
+# ---------------------------------------------------------------------------
+
+def _get_log_path() -> str:
+    """Return the log file path next to the executable (or cwd in dev mode)."""
+    if getattr(sys, 'frozen', False):
+        base = os.path.dirname(sys.executable)
+    else:
+        base = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(base, "pii_processor.log")
+
+
+LOG_PATH = _get_log_path()
+
+# Root logger for the app — all modules use getLogger(__name__) or this
+logger = logging.getLogger("pii_processor")
+logger.setLevel(logging.DEBUG)  # capture everything; handlers filter level
+
+# Rotating file handler — max 2 MB, keep 3 backups
+_file_handler = logging.handlers.RotatingFileHandler(
+    LOG_PATH, maxBytes=2 * 1024 * 1024, backupCount=3, encoding="utf-8"
+)
+_file_handler.setLevel(logging.DEBUG)
+_file_handler.setFormatter(logging.Formatter(
+    "%(asctime)s  %(levelname)-8s  %(threadName)-12s  %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+))
+logger.addHandler(_file_handler)
+
+# In-memory handler — feeds the live Debug Log tab (max 2000 records)
+class _MemHandler(logging.Handler):
+    """Thread-safe ring buffer that the Debug Log tab reads from."""
+    def __init__(self, capacity: int = 2000):
+        super().__init__()
+        self._records: list = []
+        self._capacity = capacity
+        self._lock = threading.Lock()
+        self._callbacks: list = []
+
+    def emit(self, record: logging.LogRecord):
+        with self._lock:
+            self._records.append(record)
+            if len(self._records) > self._capacity:
+                self._records.pop(0)
+        for cb in list(self._callbacks):
+            try:
+                cb(record)
+            except Exception:
+                pass
+
+    def get_records(self) -> list:
+        with self._lock:
+            return list(self._records)
+
+    def add_callback(self, fn):
+        self._callbacks.append(fn)
+
+    def remove_callback(self, fn):
+        try:
+            self._callbacks.remove(fn)
+        except ValueError:
+            pass
+
+
+MEM_LOG_HANDLER = _MemHandler(capacity=2000)
+MEM_LOG_HANDLER.setLevel(logging.DEBUG)
+MEM_LOG_HANDLER.setFormatter(logging.Formatter(
+    "%(asctime)s  %(levelname)-8s  %(message)s",
+    datefmt="%H:%M:%S",
+))
+logger.addHandler(MEM_LOG_HANDLER)
+
+logger.info("=" * 60)
+logger.info("PII Processor v%s started", APP_VERSION)
+logger.info("Log file: %s", LOG_PATH)
+logger.info("Python: %s", sys.version.split()[0])
+logger.info("Platform: %s", sys.platform)
+logger.info("=" * 60)
+
 
 try:
     from presidio_analyzer import (
@@ -550,26 +634,36 @@ class PIIEngine:
             entities = ALL_ENTITIES
 
         lang = detect_language(text)
+        char_count = len(text)
+        logger.info("Anonymize: lang=%s, chars=%d, confidence=%.2f, entities=%d",
+                    lang, char_count, confidence, len(entities))
 
         if lang == "he":
             try:
                 he_results = self._he_analyzer.analyze(text=text, language="he", score_threshold=confidence)
-            except Exception:
+                logger.debug("Hebrew analyzer: %d raw results", len(he_results))
+            except Exception as exc:
+                logger.warning("Hebrew analyzer failed: %s", exc)
                 he_results = []
             try:
                 en_results = self._en_analyzer.analyze(text=text, language="en", score_threshold=confidence)
-            except Exception:
+                logger.debug("English analyzer (Hebrew doc): %d raw results", len(en_results))
+            except Exception as exc:
+                logger.warning("English analyzer (Hebrew doc) failed: %s", exc)
                 en_results = []
             raw = list(he_results) + list(en_results)
             analysis_lang = "he"
         else:
             try:
                 raw = self._en_analyzer.analyze(text=text, language="en", entities=entities, score_threshold=confidence)
-            except Exception:
+            except Exception as exc:
+                logger.warning("English analyzer with entity filter failed (%s), retrying without filter", exc)
                 raw = self._en_analyzer.analyze(text=text, language="en", score_threshold=confidence)
             analysis_lang = "en"
+            logger.debug("English analyzer: %d raw results", len(raw))
 
         resolved = self._resolve_overlaps(raw)
+        logger.debug("After overlap resolution: %d results", len(resolved))
         mapping: Dict[str, str] = {}
         entity_counts: Dict[str, int] = {}
         value_to_ph: Dict[str, str] = {}
@@ -586,6 +680,9 @@ class PIIEngine:
                 ph = f"{{{{{label}_{entity_counts[label]}}}}}"
                 mapping[ph] = original
                 value_to_ph[original] = ph
+            # Privacy-safe debug log: placeholder and label only, NOT the original value
+            logger.debug("  Detected: %s  type=%-15s  score=%.2f  lang=%s",
+                         ph, label, result.score, analysis_lang)
             detections.append({
                 "placeholder": ph, "original": original,
                 "label": label, "score": result.score,
@@ -594,12 +691,16 @@ class PIIEngine:
             })
             text = text[:result.start] + ph + text[result.end:]
 
+        logger.info("Anonymize complete: %d unique PII items, %d total detections",
+                    len(mapping), len(detections))
         return text, mapping, detections
 
     @staticmethod
     def restore(text: str, mapping: Dict[str, str]) -> str:
+        logger.info("Restore: %d placeholders to replace", len(mapping))
         for ph, orig in mapping.items():
             text = text.replace(ph, orig)
+        logger.info("Restore complete")
         return text
 
     @property
@@ -1008,6 +1109,7 @@ class App(tk.Tk):
 
     def _load_engine(self):
         try:
+            logger.info("Loading NLP engine...")
             self.after(0, lambda: self._splash.set_status(
                 "Loading English NLP model (en_core_web_sm)..."
             ))
@@ -1015,11 +1117,13 @@ class App(tk.Tk):
             self._engine_ready = True
             model_info = engine.hebrew_ner_model
             msg = f"Engine ready — Hebrew: {model_info}"
+            logger.info("Engine loaded successfully. Hebrew NER: %s", model_info)
             self.after(0, lambda: self._splash.set_status("Engine ready! Opening application..."))
             self.after(300, self._show_main)
             self.after(0, lambda: self._set_status(msg, SUCCESS))
             self.after(0, lambda: self._lang_lbl.config(text=f"EN + HE ({model_info})", fg=SUCCESS))
         except Exception as exc:
+            logger.error("Engine load failed: %s", exc, exc_info=True)
             self.after(0, lambda: self._splash.set_status(f"Error: {exc}"))
             self.after(0, lambda: self._set_status(f"Engine error: {exc}", DANGER))
             self.after(1500, self._show_main)
@@ -1060,18 +1164,21 @@ class App(tk.Tk):
         self._tab_restore = tk.Frame(nb, bg=DARK_BG)
         self._tab_batch   = tk.Frame(nb, bg=DARK_BG)
         self._tab_custom  = tk.Frame(nb, bg=DARK_BG)
+        self._tab_debug   = tk.Frame(nb, bg=DARK_BG)
         self._tab_about   = tk.Frame(nb, bg=DARK_BG)
 
         nb.add(self._tab_anon,    text="  \U0001f512  Anonymize  ")
         nb.add(self._tab_restore, text="  \U0001f513  Restore  ")
         nb.add(self._tab_batch,   text="  \U0001f4c2  Batch Folder  ")
         nb.add(self._tab_custom,  text="  \u270f  Custom PII  ")
+        nb.add(self._tab_debug,   text="  \U0001f41b  Debug Log  ")
         nb.add(self._tab_about,   text="  \u2139  About  ")
 
         self._build_anonymize_tab()
         self._build_restore_tab()
         self._build_batch_tab()
         self._build_custom_pii_tab()
+        self._build_debug_tab()
         self._build_about_tab()
 
         bar = tk.Frame(self, bg=PANEL_BG, height=28)
@@ -1480,12 +1587,15 @@ class App(tk.Tk):
 
         def task():
             try:
+                logger.info("Anonymize task started: input=%s", os.path.basename(inp))
                 text = read_file(inp)
+                logger.debug("File read: %d chars from %s", len(text), inp)
                 engine = PIIEngine.get()
                 anon_text, mapping, detections = engine.anonymize(
                     text, confidence=confidence, entities=selected_entities)
                 # Apply manual custom PII on top of NLP results
                 if custom_entries:
+                    logger.debug("Applying %d custom PII entries", len(custom_entries))
                     entity_counts: Dict[str, int] = {}
                     value_to_ph: Dict[str, str] = {ph: orig for ph, orig in mapping.items()}
                     # Rebuild entity_counts from existing mapping
@@ -1498,10 +1608,13 @@ class App(tk.Tk):
                         anon_text, custom_entries,
                         mapping, entity_counts, value_to_ph, detections)
                 write_file(out, anon_text)
+                logger.debug("Anonymized output written: %s", out)
                 with open(mapf, "w", encoding="utf-8") as fh:
                     json.dump(mapping, fh, indent=4, ensure_ascii=False)
+                logger.info("Mapping file written: %s (%d entries)", mapf, len(mapping))
                 self.after(0, lambda: self._on_anonymize_done(anon_text, mapping, detections, out, mapf))
             except Exception as exc:
+                logger.error("Anonymize task failed: %s", exc, exc_info=True)
                 self.after(0, lambda: self._on_error(str(exc)))
 
         threading.Thread(target=task, daemon=True).start()
@@ -1540,13 +1653,18 @@ class App(tk.Tk):
 
         def task():
             try:
+                logger.info("Restore task started: input=%s", os.path.basename(inp))
                 text = read_file(inp)
+                logger.debug("Anonymized file read: %d chars", len(text))
                 with open(mapf, "r", encoding="utf-8") as fh:
                     mapping = json.load(fh)
+                logger.debug("Mapping loaded: %d entries from %s", len(mapping), mapf)
                 restored = PIIEngine.restore(text, mapping)
                 write_file(out, restored)
+                logger.info("Restore complete: output written to %s", out)
                 self.after(0, lambda: self._on_restore_done(restored, mapping, out))
             except Exception as exc:
+                logger.error("Restore task failed: %s", exc, exc_info=True)
                 self.after(0, lambda: self._on_error(str(exc)))
 
         threading.Thread(target=task, daemon=True).start()
@@ -1606,7 +1724,125 @@ class App(tk.Tk):
 
         threading.Thread(target=_check, daemon=True).start()
 
+    # -----------------------------------------------------------------------
+    #  Debug Log tab
+    # -----------------------------------------------------------------------
+
+    def _build_debug_tab(self):
+        tab = self._tab_debug
+
+        # ---- toolbar ----
+        toolbar = tk.Frame(tab, bg=PANEL_BG)
+        toolbar.pack(fill="x", padx=12, pady=(10, 0))
+
+        section_label(toolbar, "DEBUG LOG").pack(side="left", padx=(4, 16))
+
+        # Debug mode toggle
+        self._debug_mode = tk.BooleanVar(value=False)
+        def _toggle_debug():
+            if self._debug_mode.get():
+                MEM_LOG_HANDLER.setLevel(logging.DEBUG)
+                _file_handler.setLevel(logging.DEBUG)
+                logger.info("Debug mode ENABLED")
+                self._debug_toggle_btn.config(text="U0001f41b Debug Mode: ON", fg=SUCCESS)
+            else:
+                MEM_LOG_HANDLER.setLevel(logging.INFO)
+                _file_handler.setLevel(logging.INFO)
+                logger.info("Debug mode DISABLED")
+                self._debug_toggle_btn.config(text="U0001f41b Debug Mode: OFF", fg=TEXT_DIM)
+
+        self._debug_toggle_btn = tk.Button(
+            toolbar, text="U0001f41b Debug Mode: OFF",
+            bg=PANEL_BG, fg=TEXT_DIM, relief="flat",
+            font=("Segoe UI", 9), cursor="hand2",
+            command=lambda: [self._debug_mode.set(not self._debug_mode.get()), _toggle_debug()]
+        )
+        self._debug_toggle_btn.pack(side="left", padx=4)
+
+        tk.Label(toolbar, text="|", bg=PANEL_BG, fg=BORDER).pack(side="left", padx=4)
+
+        tk.Button(toolbar, text="U0001f5d1  Clear",
+                  bg=PANEL_BG, fg=TEXT_DIM, relief="flat",
+                  font=("Segoe UI", 9), cursor="hand2",
+                  command=self._debug_clear).pack(side="left", padx=4)
+
+        tk.Button(toolbar, text="U0001f4cb  Copy Log",
+                  bg=PANEL_BG, fg=TEXT_DIM, relief="flat",
+                  font=("Segoe UI", 9), cursor="hand2",
+                  command=self._debug_copy).pack(side="left", padx=4)
+
+        tk.Button(toolbar, text="U0001f4c4  Open Log File",
+                  bg=PANEL_BG, fg=TEXT_DIM, relief="flat",
+                  font=("Segoe UI", 9), cursor="hand2",
+                  command=self._debug_open_file).pack(side="left", padx=4)
+
+        lp_lbl = tk.Label(toolbar, text=f"Log: {LOG_PATH}",
+                          bg=PANEL_BG, fg=TEXT_DIM, font=("Segoe UI", 8))
+        lp_lbl.pack(side="right", padx=8)
+
+        # ---- log text widget ----
+        self._debug_txt = scrolledtext.ScrolledText(
+            tab, bg="#0d0d0d", fg="#cccccc",
+            insertbackground="white",
+            font=("Consolas", 9), relief="flat", wrap="word",
+            selectbackground=ACCENT, selectforeground="white",
+            state="disabled"
+        )
+        self._debug_txt.pack(fill="both", expand=True, padx=12, pady=(6, 12))
+
+        # colour tags per level
+        self._debug_txt.tag_configure("DEBUG",    foreground="#888888")
+        self._debug_txt.tag_configure("INFO",     foreground="#cccccc")
+        self._debug_txt.tag_configure("WARNING",  foreground=WARNING)
+        self._debug_txt.tag_configure("ERROR",    foreground=DANGER)
+        self._debug_txt.tag_configure("CRITICAL", foreground="#ff00ff")
+
+        # Populate with records already in the buffer
+        for rec in MEM_LOG_HANDLER.get_records():
+            self._debug_append_record(rec)
+
+        # Register live callback
+        MEM_LOG_HANDLER.add_callback(lambda rec: self.after(0, lambda r=rec: self._debug_append_record(r)))
+
+    def _debug_append_record(self, record: logging.LogRecord):
+        """Append a single log record to the debug text widget."""
+        try:
+            msg = MEM_LOG_HANDLER.format(record)
+            tag = record.levelname  # DEBUG / INFO / WARNING / ERROR / CRITICAL
+            self._debug_txt.config(state="normal")
+            self._debug_txt.insert("end", msg + "\n", tag)
+            self._debug_txt.see("end")
+            self._debug_txt.config(state="disabled")
+        except Exception:
+            pass
+
+    def _debug_clear(self):
+        self._debug_txt.config(state="normal")
+        self._debug_txt.delete("1.0", "end")
+        self._debug_txt.config(state="disabled")
+        logger.info("Debug log display cleared by user")
+
+    def _debug_copy(self):
+        content = self._debug_txt.get("1.0", "end")
+        self.clipboard_clear()
+        self.clipboard_append(content)
+        self._set_status("Debug log copied to clipboard.", SUCCESS)
+
+    def _debug_open_file(self):
+        """Open the log file in the system default text editor."""
+        try:
+            if sys.platform.startswith("win"):
+                os.startfile(LOG_PATH)
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", LOG_PATH])
+            else:
+                subprocess.Popen(["xdg-open", LOG_PATH])
+        except Exception as exc:
+            messagebox.showerror("Cannot Open Log",
+                f"Could not open log file:\n{LOG_PATH}\n\nError: {exc}")
+
     def _on_error(self, msg: str):
+        logger.error("UI error: %s", msg)
         self._stop_spinner()
         self._set_status(f"Error: {msg}", DANGER)
         messagebox.showerror("Error", msg)
@@ -1942,6 +2178,10 @@ class App(tk.Tk):
         self._start_spinner(f"Batch processing {len(files)} files...")
         self._set_status(f"Batch processing {len(files)} files...", WARNING)
 
+        logger.info("Batch anonymize started: %d files in %s", len(files), src)
+        if merged_custom:
+            logger.info("Batch: %d custom PII entries loaded", len(merged_custom))
+
         def task():
             ok = 0
             fail = 0
@@ -1951,6 +2191,7 @@ class App(tk.Tk):
                 out_path = os.path.join(out, base + "_anonymized.txt")
                 map_path = os.path.join(out, base + "_mapping.json")
                 try:
+                    logger.info("Batch: processing %s", fname)
                     text = read_file(fpath)
                     engine = PIIEngine.get()
                     anon_text, mapping, detections = engine.anonymize(
@@ -1970,15 +2211,18 @@ class App(tk.Tk):
                     with open(map_path, "w", encoding="utf-8") as fh:
                         json.dump(mapping, fh, indent=4, ensure_ascii=False)
                     n = len(mapping)
+                    logger.info("Batch: OK  %s  -> %d PII items", fname, n)
                     self.after(0, lambda fn=fname, n=n:
-                        self._batch_log_write(f"  \u2714  {fn}  →  {n} PII items replaced", "ok"))
+                        self._batch_log_write(f"  \u2714  {fn}  \u2192  {n} PII items replaced", "ok"))
                     ok += 1
                 except Exception as exc:
+                    logger.error("Batch: FAIL  %s  -> %s", fname, exc, exc_info=True)
                     self.after(0, lambda fn=fname, e=str(exc):
-                        self._batch_log_write(f"  \u2718  {fn}  —  ERROR: {e}", "err"))
+                        self._batch_log_write(f"  \u2718  {fn}  \u2014  ERROR: {e}", "err"))
                     fail += 1
 
             def done():
+                logger.info("Batch complete: %d succeeded, %d failed", ok, fail)
                 self._stop_spinner()
                 self._batch_log_write("", "")
                 self._batch_log_write(

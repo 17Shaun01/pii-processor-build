@@ -35,10 +35,8 @@ jobs:
 
       - name: Install core dependencies
         run: |
-          pip install click
-          pip install presidio-analyzer presidio-anonymizer
-          pip install spacy
-          pip install python-docx "pdfminer.six" pyinstaller
+          pip install -r requirements.txt
+          pip install pyinstaller
 
       # ----------------------------------------------------------------
       # 4. Download spaCy models
