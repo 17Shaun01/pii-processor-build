@@ -402,6 +402,25 @@ class PIIEngine:
         return AnalyzerEngine(nlp_engine=nlp_engine, registry=registry, supported_languages=["en"])
 
     def _build_he_analyzer(self) -> AnalyzerEngine:
+        """Build the Hebrew analyzer engine.
+
+        Strategy: always build a registry where every recognizer is registered
+        under the SAME language code as the engine's supported_languages list.
+        Never call load_predefined_recognizers() because it registers everything
+        as 'en', which causes a Presidio validation error when the engine is
+        declared as 'he'.
+        """
+        from presidio_analyzer.predefined_recognizers import (
+            EmailRecognizer, IbanRecognizer, CreditCardRecognizer,
+            UrlRecognizer, IpRecognizer,
+        )
+        try:
+            from presidio_analyzer.predefined_recognizers import PhoneRecognizer
+            _has_phone = True
+        except Exception:
+            _has_phone = False
+
+        # --- Try to load the multilingual xx model (bundled in the .exe) ---
         nlp_engine = None
         try:
             import spacy
@@ -415,66 +434,79 @@ class PIIEngine:
         except Exception:
             self._xx_available = False
 
-        registry = RecognizerRegistry()
+        # Choose the language tag that will be used for EVERY recognizer
+        # and for the AnalyzerEngine — they MUST match.
         if nlp_engine:
-            registry.load_predefined_recognizers(nlp_engine=nlp_engine)
-
-        registry.add_recognizer(IsraeliIdRecognizer(lang="he"))
-        registry.add_recognizer(IsraeliPhoneRecognizer(lang="he"))
-        registry.add_recognizer(HebrewDateRecognizer(lang="he"))
-        registry.add_recognizer(HebrewNameRecognizer())
-        registry.add_recognizer(HebrewLocationRecognizer())
-
-        from presidio_analyzer.predefined_recognizers import (
-            EmailRecognizer, IbanRecognizer, CreditCardRecognizer, UrlRecognizer, IpRecognizer,
-        )
-        for rec_cls in (EmailRecognizer, IbanRecognizer, CreditCardRecognizer, UrlRecognizer, IpRecognizer):
+            lang = "he"
+        else:
+            # Fall back to en_core_web_sm; use "en" throughout
+            lang = "en"
             try:
-                registry.add_recognizer(rec_cls(supported_language="he"))
+                provider2 = NlpEngineProvider(nlp_configuration={
+                    "nlp_engine_name": "spacy",
+                    "models": [{"lang_code": "en", "model_name": "en_core_web_sm"}],
+                })
+                nlp_engine = provider2.create_engine()
+            except Exception:
+                return self._en_analyzer  # absolute last resort
+
+        # Build a clean registry — all recognizers registered under `lang`
+        registry = RecognizerRegistry()
+
+        # Custom Israeli / Hebrew recognizers
+        registry.add_recognizer(IsraeliIdRecognizer(lang=lang))
+        registry.add_recognizer(IsraeliPhoneRecognizer(lang=lang))
+        registry.add_recognizer(HebrewDateRecognizer(lang=lang))
+
+        # Dictionary-based Hebrew NER (only useful when lang=="he", but harmless otherwise)
+        if lang == "he":
+            registry.add_recognizer(HebrewNameRecognizer())
+            registry.add_recognizer(HebrewLocationRecognizer())
+
+        # Standard Presidio recognizers — all registered under `lang`
+        for rec_cls in (EmailRecognizer, IbanRecognizer, CreditCardRecognizer,
+                        UrlRecognizer, IpRecognizer):
+            try:
+                registry.add_recognizer(rec_cls(supported_language=lang))
             except Exception:
                 pass
 
-        try:
-            from presidio_analyzer.predefined_recognizers import PhoneRecognizer
+        if _has_phone:
             try:
-                registry.add_recognizer(PhoneRecognizer(supported_language="he", supported_regions=["IL"]))
+                registry.add_recognizer(
+                    PhoneRecognizer(supported_language=lang, supported_regions=["IL"])
+                )
             except Exception:
-                registry.add_recognizer(PhoneRecognizer(supported_language="he"))
+                try:
+                    registry.add_recognizer(PhoneRecognizer(supported_language=lang))
+                except Exception:
+                    pass
+
+        # NLP-backed recognizers for PERSON / LOCATION / ORG via spaCy NER
+        from presidio_analyzer.predefined_recognizers import SpacyRecognizer
+        try:
+            registry.add_recognizer(
+                SpacyRecognizer(
+                    supported_language=lang,
+                    supported_entities=["PERSON", "LOCATION", "ORGANIZATION",
+                                        "DATE_TIME", "NRP"],
+                    check_label_groups=[
+                        ({"PERSON"},   {"PER", "PERSON"}),
+                        ({"LOCATION"}, {"LOC", "GPE", "FAC"}),
+                        ({"ORGANIZATION"}, {"ORG"}),
+                        ({"DATE_TIME"}, {"DATE", "TIME"}),
+                        ({"NRP"}, {"NORP"}),
+                    ],
+                )
+            )
         except Exception:
             pass
 
-        if nlp_engine:
-            return AnalyzerEngine(nlp_engine=nlp_engine, registry=registry, supported_languages=["he"])
-        else:
-            # xx model unavailable — fall back to en_core_web_sm mapped to "he"
-            # We must register all custom recognizers as "en" to match the engine language
-            registry2 = RecognizerRegistry()
-            registry2.add_recognizer(IsraeliIdRecognizer(lang="en"))
-            registry2.add_recognizer(IsraeliPhoneRecognizer(lang="en"))
-            registry2.add_recognizer(HebrewDateRecognizer(lang="en"))
-            for rec_cls in (EmailRecognizer, IbanRecognizer, CreditCardRecognizer, UrlRecognizer, IpRecognizer):
-                try:
-                    registry2.add_recognizer(rec_cls(supported_language="en"))
-                except Exception:
-                    pass
-            try:
-                from presidio_analyzer.predefined_recognizers import PhoneRecognizer
-                try:
-                    registry2.add_recognizer(PhoneRecognizer(supported_language="en", supported_regions=["IL"]))
-                except Exception:
-                    registry2.add_recognizer(PhoneRecognizer(supported_language="en"))
-            except Exception:
-                pass
-            provider = NlpEngineProvider(nlp_configuration={
-                "nlp_engine_name": "spacy",
-                "models": [{"lang_code": "en", "model_name": "en_core_web_sm"}],
-            })
-            try:
-                fallback_engine = provider.create_engine()
-                registry2.load_predefined_recognizers(nlp_engine=fallback_engine)
-                return AnalyzerEngine(nlp_engine=fallback_engine, registry=registry2, supported_languages=["en"])
-            except Exception:
-                return self._en_analyzer  # last resort: reuse English analyzer
+        return AnalyzerEngine(
+            nlp_engine=nlp_engine,
+            registry=registry,
+            supported_languages=[lang],
+        )
 
     @staticmethod
     def _map_entity(entity_type: str) -> str:
