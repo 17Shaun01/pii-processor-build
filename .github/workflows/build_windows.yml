@@ -229,12 +229,13 @@ jobs:
           body: |
             ## PII Processor v${{ steps.get_version.outputs.version }}
 
-            ### What's included
-            - Full Hebrew + English PII detection (Israeli ID, phone, IBAN, dates)
+            ### What's new in this release
+            - Fixed updater SSL error ("Update check failed: None") on Windows
+            - Hebrew ambiguity review dialog: checklist of potential names for user confirmation
+            - Debug Log tab with rotating log file and live viewer
             - Batch folder processing
             - Custom PII project lists (saved per matter folder)
-            - In-app auto-updater — future updates install with one click
-            - Engine fix: no more "misconfigured engine" error on Hebrew documents
+            - Full Hebrew + English PII detection (Israeli ID, phone, IBAN, dates)
 
             ### How to install
             1. Download `PII_Processor.exe` below

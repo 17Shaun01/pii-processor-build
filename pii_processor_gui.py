@@ -31,6 +31,7 @@ from tkinter import filedialog, messagebox, scrolledtext, ttk
 from typing import Dict, List, Optional, Tuple
 import urllib.request
 import urllib.error
+import ssl
 import tempfile
 import shutil
 import subprocess
@@ -39,11 +40,34 @@ import datetime
 # ---------------------------------------------------------------------------
 #  Version — bump this for every release
 # ---------------------------------------------------------------------------
-APP_VERSION = "5.3"
+APP_VERSION = "0.5.3"
 UPDATE_MANIFEST_URL = (
     "https://github.com/17Shaun01/pii-processor-build/"
     "releases/latest/download/version.json"
 )
+
+# ---------------------------------------------------------------------------
+#  SSL context helper — uses certifi CA bundle when available so that
+#  HTTPS requests work correctly inside a PyInstaller bundle on Windows
+# ---------------------------------------------------------------------------
+
+def _make_ssl_context() -> ssl.SSLContext:
+    """Return an SSL context that trusts the system/certifi CA bundle."""
+    try:
+        import certifi
+        ctx = ssl.create_default_context(cafile=certifi.where())
+        return ctx
+    except ImportError:
+        pass
+    try:
+        ctx = ssl.create_default_context()
+        return ctx
+    except Exception:
+        pass
+    # Last resort: unverified (not ideal but better than crashing)
+    ctx = ssl._create_unverified_context()
+    return ctx
+
 
 # ---------------------------------------------------------------------------
 #  Logging setup
@@ -867,17 +891,20 @@ class Updater:
                 UPDATE_MANIFEST_URL,
                 headers={"User-Agent": f"PII-Processor/{APP_VERSION}"},
             )
-            with urllib.request.urlopen(req, timeout=8) as resp:
+            ctx = _make_ssl_context()
+            with urllib.request.urlopen(req, timeout=15, context=ctx) as resp:
                 data = json.loads(resp.read().decode())
             latest = data.get("version", "")
             url    = data.get("download_url", "")
             notes  = data.get("release_notes", "")
+            logger.debug("Update check: latest=%s current=%s", latest, APP_VERSION)
             if latest and url and self._is_newer(latest):
                 self._app.after(0, lambda: self._on_update_available(
                     latest, url, notes
                 ))
-        except Exception:
-            pass  # silently ignore network errors
+        except Exception as exc:
+            logger.warning("Background update check failed: %s: %s",
+                           type(exc).__name__, exc)  # logged but not shown to user
 
     @staticmethod
     def _is_newer(remote: str) -> bool:
@@ -934,11 +961,12 @@ class Updater:
             exe_dir = os.path.dirname(current_exe)
             tmp_path = os.path.join(exe_dir, f"_update_{version}.exe")
 
+            ctx = _make_ssl_context()
             req = urllib.request.Request(
                 url,
                 headers={"User-Agent": f"PII-Processor/{APP_VERSION}"},
             )
-            with urllib.request.urlopen(req, timeout=120) as resp:
+            with urllib.request.urlopen(req, timeout=120, context=ctx) as resp:
                 total = int(resp.headers.get("Content-Length", 0))
                 downloaded = 0
                 chunk = 65536
@@ -964,13 +992,28 @@ class Updater:
             self._app.after(0, lambda: dlg.set_status("Restarting..."))
             self._app.after(500, lambda: self._restart(current_exe))
 
-        except Exception as exc:
+        except urllib.error.URLError as exc:
+            reason = exc.reason if exc.reason else str(exc)
+            logger.error("Update download URLError: %s", reason)
             self._app.after(0, lambda: dlg.destroy())
             self._app.after(
                 0,
-                lambda: messagebox.showerror(
+                lambda r=str(reason): messagebox.showerror(
                     "Update Failed",
-                    f"Could not download update:\n{exc}\n\n"
+                    f"Network error while downloading update:\n{r}\n\n"
+                    "Please check your internet connection and try again,\n"
+                    "or download the latest version manually from GitHub.",
+                ),
+            )
+        except Exception as exc:
+            err = f"{type(exc).__name__}: {exc}"
+            logger.error("Update download failed: %s", err)
+            self._app.after(0, lambda: dlg.destroy())
+            self._app.after(
+                0,
+                lambda e=err: messagebox.showerror(
+                    "Update Failed",
+                    f"Could not download update:\n{e}\n\n"
                     "Please download the latest version manually from GitHub.",
                 ),
             )
@@ -2090,11 +2133,13 @@ class App(tk.Tk):
                     UPDATE_MANIFEST_URL,
                     headers={"User-Agent": f"PII-Processor/{APP_VERSION}"},
                 )
-                with urllib.request.urlopen(req, timeout=8) as resp:
+                ctx = _make_ssl_context()
+                with urllib.request.urlopen(req, timeout=15, context=ctx) as resp:
                     data = json.loads(resp.read().decode())
                 latest  = data.get("version", "")
                 url     = data.get("download_url", "")
                 notes   = data.get("release_notes", "")
+                logger.debug("Manual update check: latest=%s current=%s", latest, APP_VERSION)
                 if latest and url and Updater._is_newer(latest):
                     self.after(0, lambda: self._update_status_lbl.config(
                         text=f"\u2b06 Update available: v{latest}  ({notes})",
@@ -2112,9 +2157,18 @@ class App(tk.Tk):
                     self.after(0, lambda: self._update_status_lbl.config(
                         text="Could not read version manifest", fg=DANGER
                     ))
+            except urllib.error.URLError as exc:
+                reason = exc.reason if exc.reason else str(exc)
+                err_msg = f"Network error: {reason}"
+                logger.warning("Manual update check URLError: %s", reason)
+                self.after(0, lambda m=err_msg: self._update_status_lbl.config(
+                    text=m, fg=DANGER
+                ))
             except Exception as exc:
-                self.after(0, lambda: self._update_status_lbl.config(
-                    text=f"Update check failed: {exc}", fg=DANGER
+                err_msg = f"Update check failed: {type(exc).__name__}: {exc}"
+                logger.warning("Manual update check exception: %s", err_msg)
+                self.after(0, lambda m=err_msg: self._update_status_lbl.config(
+                    text=m, fg=DANGER
                 ))
 
         threading.Thread(target=_check, daemon=True).start()
