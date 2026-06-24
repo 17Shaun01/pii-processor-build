@@ -39,7 +39,7 @@ import datetime
 # ---------------------------------------------------------------------------
 #  Version — bump this for every release
 # ---------------------------------------------------------------------------
-APP_VERSION = "5.2"
+APP_VERSION = "5.3"
 UPDATE_MANIFEST_URL = (
     "https://github.com/17Shaun01/pii-processor-build/"
     "releases/latest/download/version.json"
@@ -1019,6 +1019,350 @@ class _UpdateDownloadDialog(tk.Toplevel):
         self.update_idletasks()
 
 
+# ---------------------------------------------------------------------------
+#  Hebrew ambiguity detection
+# ---------------------------------------------------------------------------
+
+# Hebrew title/honorific words that strongly suggest the following word is a name
+HEBREW_TITLE_WORDS = {
+    "אדון", "גברת", "גב", "רב", "הרב", "שופט", "שופטת", "עורך", "עורכת",
+    "מר", "הנאשם", "הנאשמת", "התובע", "התובעת", "הנתבע", "הנתבעת",
+    "המבקש", "המבקשת", "המשיב", "המשיבה", "הצד", "הלקוח", "הלקוחה",
+    "פרופסור", "דוקטור", "עורך דין", "עורכת דין",
+    # With geresh/gershayim (unicode escapes to avoid string literal issues)
+    "\u05d2\u05d1\u05f3",   # גב׳
+    "\u05d3\u05f4\u05e8",   # ד״ר
+    "\u05e2\u05d5\u05f4\u05d3",  # עו״ד
+    "\u05e2\u05d5\u05d4\u05f4\u05d3",  # עוה״ד
+    "\u05e4\u05e8\u05d5\u05e4\u05f3",  # פרופ׳
+    "\u05d3\u05e8\u05f3",   # דר׳
+}
+
+# Hebrew words that are BOTH common nouns AND names — the ambiguous set
+# These are words from the dictionary that are also everyday Hebrew words
+HEBREW_AMBIGUOUS_NAMES = {
+    # Names that are also nouns/adjectives
+    "אביב", "אביגיל", "אור", "אורה", "אורי", "אורן", "אורית",
+    "אלה", "אלון", "אמיר", "אסף", "ארז", "ארי", "אריאל", "אריה",
+    "בועז", "בן", "בר", "גל", "גלי", "גפן", "דביר", "דגן", "דוד",
+    "דור", "דנה", "דפנה", "הדס", "הדסה", "הילה", "זהר", "זיו",
+    "חן", "חנה", "טל", "יאיר", "יובל", "יונה", "יונתן", "יורם",
+    "יחיאל", "ים", "יניב", "יעל", "יצחק", "ירדן", "כרמל", "לב",
+    "לי", "לילה", "לימור", "מור", "מיה", "מיכל", "מירב", "מירי",
+    "מנחם", "מעיין", "מרב", "נדב", "נוי", "נועה", "נועם", "נורית",
+    "נטע", "ניב", "ניר", "נעם", "נעמי", "נתן", "סהר", "סיון",
+    "עדי", "עומר", "עידן", "עינב", "עמית", "עמנואל", "ענבל",
+    "ענת", "עפר", "ערן", "פנינה", "צבי", "צור", "קרן", "רוי",
+    "רון", "רונה", "רונית", "רות", "רז", "ריבה", "רם", "שגיא",
+    "שחר", "שי", "שיר", "שירה", "שלג", "שלום", "שמש", "שני",
+    "שקד", "תהל", "תום", "תמר",
+    # Locations that are also common words
+    "רמת", "גן", "עמק", "מרכז", "צפון", "דרום", "מזרח", "מערב",
+    "שרון", "כרמל", "גלבוע", "עמק",
+}
+
+
+def find_hebrew_ambiguous_candidates(
+    original_text: str,
+    already_mapped_values: set,
+) -> List[dict]:
+    """
+    Scan a Hebrew document for tokens that:
+      1. Appear in the Hebrew name/location dictionaries, AND
+      2. Were NOT already detected by the NLP engine, AND
+      3. Are ambiguous (also common Hebrew nouns)
+
+    Returns a list of candidate dicts:
+      {"text": str, "label": str, "context": str, "count": int}
+    sorted by frequency descending.
+    """
+    if not HEBREW_FIRST_NAMES and not HEBREW_LAST_NAMES and not HEBREW_LOCATIONS:
+        return []
+
+    all_names = HEBREW_FIRST_NAMES | HEBREW_LAST_NAMES
+    candidates: Dict[str, dict] = {}
+
+    # Split into sentences for context extraction
+    sentences = re.split(r'[.!?\n]+', original_text)
+    sentence_map: Dict[int, str] = {}  # char_offset -> sentence text
+    pos = 0
+    for sent in sentences:
+        for i in range(pos, pos + len(sent) + 1):
+            sentence_map[i] = sent.strip()
+        pos += len(sent) + 1
+
+    # Tokenize: split on whitespace and punctuation, keep Hebrew words
+    hebrew_word_re = re.compile(r'[\u05d0-\u05ea\ufb1d-\ufb4e\'\"״׳]+')
+
+    for m in hebrew_word_re.finditer(original_text):
+        word = m.group().strip("'\"״׳")
+        if len(word) < 2:
+            continue
+        # Skip if already replaced by NLP engine
+        if word in already_mapped_values:
+            continue
+
+        suggested_label = None
+        is_ambiguous = word in HEBREW_AMBIGUOUS_NAMES
+
+        # Check if it's a name (first or last)
+        if word in all_names:
+            suggested_label = "PERSON"
+        elif word in HEBREW_LOCATIONS:
+            suggested_label = "LOCATION"
+
+        if suggested_label is None:
+            continue
+
+        # Check if preceded by a title word (strong signal → include even if not ambiguous)
+        start = m.start()
+        preceding = original_text[max(0, start - 20):start].strip()
+        preceding_words = preceding.split()
+        preceded_by_title = any(w.strip("'\"״׳") in HEBREW_TITLE_WORDS
+                                 for w in preceding_words[-3:])
+
+        # Include if: (a) preceded by title, OR (b) ambiguous word in dictionary
+        if not preceded_by_title and not is_ambiguous:
+            continue
+
+        # Get context sentence
+        context = sentence_map.get(start, "")[:120]
+        if not context:
+            context = original_text[max(0, start - 40):start + len(word) + 40]
+
+        if word not in candidates:
+            candidates[word] = {
+                "text": word,
+                "label": suggested_label,
+                "context": context,
+                "count": 0,
+                "preceded_by_title": preceded_by_title,
+            }
+        candidates[word]["count"] += 1
+        if preceded_by_title:
+            candidates[word]["preceded_by_title"] = True
+
+    # Sort: title-preceded first, then by frequency
+    result = sorted(
+        candidates.values(),
+        key=lambda c: (not c["preceded_by_title"], -c["count"])
+    )
+    logger.debug("Hebrew ambiguity scan: %d candidates found", len(result))
+    return result
+
+
+class HebrewReviewDialog(tk.Toplevel):
+    """
+    Modal dialog shown after Hebrew NLP detection.
+    Presents a checklist of ambiguous Hebrew words so the user can
+    confirm which ones are PII (names/locations) before anonymization.
+    """
+
+    def __init__(self, parent, candidates: List[dict]):
+        super().__init__(parent)
+        self.title("Hebrew PII Review — Confirm Ambiguous Terms")
+        self.configure(bg=DARK_BG)
+        self.resizable(True, True)
+        self.grab_set()  # modal
+
+        # Size and centre
+        w, h = 780, 560
+        sw = self.winfo_screenwidth()
+        sh = self.winfo_screenheight()
+        self.geometry(f"{w}x{h}+{(sw - w) // 2}+{(sh - h) // 2}")
+        self.minsize(600, 400)
+
+        self._candidates = candidates
+        self._vars: List[tk.BooleanVar] = []
+        self._label_vars: List[tk.StringVar] = []
+        self.approved: List[dict] = []  # filled on Confirm
+        self._confirmed = False
+
+        self._build_ui()
+        self.protocol("WM_DELETE_WINDOW", self._on_skip)
+
+    def _build_ui(self):
+        # ── Header ──────────────────────────────────────────────────────────
+        hdr = tk.Frame(self, bg=PANEL_BG)
+        hdr.pack(fill="x")
+        tk.Label(
+            hdr,
+            text="Hebrew PII Review",
+            bg=PANEL_BG, fg=ACCENT,
+            font=("Segoe UI", 13, "bold"),
+        ).pack(side="left", padx=16, pady=10)
+
+        tk.Label(
+            hdr,
+            text=f"{len(self._candidates)} ambiguous term(s) found",
+            bg=PANEL_BG, fg=TEXT_DIM,
+            font=("Segoe UI", 9),
+        ).pack(side="right", padx=16)
+
+        # ── Instruction ──────────────────────────────────────────────────────
+        tk.Label(
+            self,
+            text=(
+                "The following Hebrew words were found in the document. They appear in the name/location "
+                "dictionary but may also be common nouns.\n"
+                "Tick the checkbox next to each word that IS a person name or location that should be anonymized."
+            ),
+            bg=DARK_BG, fg=TEXT_MAIN,
+            font=("Segoe UI", 9),
+            wraplength=740, justify="left",
+        ).pack(fill="x", padx=16, pady=(8, 4))
+
+        # ── Select all / none ────────────────────────────────────────────────
+        ctrl = tk.Frame(self, bg=DARK_BG)
+        ctrl.pack(fill="x", padx=16, pady=(0, 4))
+        tk.Button(ctrl, text="Select All", bg=PANEL_BG, fg=TEXT_MAIN,
+                  relief="flat", font=("Segoe UI", 9), cursor="hand2",
+                  command=self._select_all).pack(side="left", padx=(0, 8))
+        tk.Button(ctrl, text="Select None", bg=PANEL_BG, fg=TEXT_MAIN,
+                  relief="flat", font=("Segoe UI", 9), cursor="hand2",
+                  command=self._select_none).pack(side="left")
+
+        # ── Scrollable candidate list ────────────────────────────────────────
+        outer = tk.Frame(self, bg=DARK_BG)
+        outer.pack(fill="both", expand=True, padx=16, pady=(0, 8))
+
+        canvas = tk.Canvas(outer, bg=DARK_BG, highlightthickness=0)
+        scrollbar = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
+        self._scroll_frame = tk.Frame(canvas, bg=DARK_BG)
+
+        self._scroll_frame.bind(
+            "<Configure>",
+            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+        )
+        canvas.create_window((0, 0), window=self._scroll_frame, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+
+        # Bind mousewheel
+        canvas.bind_all("<MouseWheel>",
+            lambda e: canvas.yview_scroll(int(-1 * (e.delta / 120)), "units"))
+
+        # Column headers
+        hdr_row = tk.Frame(self._scroll_frame, bg=PANEL_BG)
+        hdr_row.pack(fill="x", pady=(0, 2))
+        tk.Label(hdr_row, text="Include", bg=PANEL_BG, fg=TEXT_DIM,
+                 font=("Segoe UI", 8, "bold"), width=8).pack(side="left", padx=4)
+        tk.Label(hdr_row, text="Hebrew Word", bg=PANEL_BG, fg=TEXT_DIM,
+                 font=("Segoe UI", 8, "bold"), width=14).pack(side="left", padx=4)
+        tk.Label(hdr_row, text="Count", bg=PANEL_BG, fg=TEXT_DIM,
+                 font=("Segoe UI", 8, "bold"), width=6).pack(side="left", padx=4)
+        tk.Label(hdr_row, text="Label", bg=PANEL_BG, fg=TEXT_DIM,
+                 font=("Segoe UI", 8, "bold"), width=12).pack(side="left", padx=4)
+        tk.Label(hdr_row, text="Context (surrounding text)", bg=PANEL_BG, fg=TEXT_DIM,
+                 font=("Segoe UI", 8, "bold")).pack(side="left", padx=4)
+
+        # Candidate rows
+        LABEL_OPTIONS = ["PERSON", "LOCATION", "ORGANIZATION", "CUSTOM"]
+        for i, cand in enumerate(self._candidates):
+            row_bg = DARK_BG if i % 2 == 0 else PANEL_BG
+            row = tk.Frame(self._scroll_frame, bg=row_bg)
+            row.pack(fill="x", pady=1)
+
+            # Pre-tick if preceded by title word
+            default_checked = cand.get("preceded_by_title", False)
+            var = tk.BooleanVar(value=default_checked)
+            self._vars.append(var)
+
+            tk.Checkbutton(
+                row, variable=var,
+                bg=row_bg, activebackground=row_bg,
+                selectcolor=ENTRY_BG, fg=TEXT_MAIN,
+                width=6,
+            ).pack(side="left", padx=4)
+
+            # Hebrew word (RTL display)
+            tk.Label(
+                row, text=cand["text"],
+                bg=row_bg, fg=TAG_PERSON,
+                font=("David", 11, "bold") if sys.platform == "win32" else ("Segoe UI", 11, "bold"),
+                width=14, anchor="e",  # right-align for RTL
+            ).pack(side="left", padx=4)
+
+            # Count
+            tk.Label(
+                row, text=str(cand["count"]),
+                bg=row_bg, fg=TEXT_DIM,
+                font=("Segoe UI", 9), width=6,
+            ).pack(side="left", padx=4)
+
+            # Label dropdown
+            lvar = tk.StringVar(value=cand["label"])
+            self._label_vars.append(lvar)
+            ttk.Combobox(
+                row, textvariable=lvar,
+                values=LABEL_OPTIONS, state="readonly",
+                width=12, font=("Segoe UI", 9),
+            ).pack(side="left", padx=4)
+
+            # Context snippet
+            ctx = cand.get("context", "")[:100]
+            tk.Label(
+                row, text=ctx,
+                bg=row_bg, fg=TEXT_DIM,
+                font=("Segoe UI", 8),
+                anchor="w", justify="left",
+                wraplength=340,
+            ).pack(side="left", padx=4, fill="x", expand=True)
+
+        # ── Footer buttons ───────────────────────────────────────────────────
+        footer = tk.Frame(self, bg=PANEL_BG)
+        footer.pack(fill="x", side="bottom")
+
+        styled_button(
+            footer, "✓  Confirm & Anonymize",
+            command=self._on_confirm,
+        ).pack(side="right", padx=12, pady=8)
+
+        tk.Button(
+            footer, text="Skip — Anonymize Without These",
+            bg=PANEL_BG, fg=TEXT_DIM,
+            relief="flat", font=("Segoe UI", 9),
+            cursor="hand2",
+            command=self._on_skip,
+        ).pack(side="right", padx=4, pady=8)
+
+        tk.Label(
+            footer,
+            text="Ticked items will be replaced with placeholders.",
+            bg=PANEL_BG, fg=TEXT_DIM,
+            font=("Segoe UI", 8),
+        ).pack(side="left", padx=12)
+
+    def _select_all(self):
+        for v in self._vars:
+            v.set(True)
+
+    def _select_none(self):
+        for v in self._vars:
+            v.set(False)
+
+    def _on_confirm(self):
+        self.approved = [
+            {"text": self._candidates[i]["text"],
+             "label": self._label_vars[i].get()}
+            for i, v in enumerate(self._vars) if v.get()
+        ]
+        logger.info("Hebrew review: user approved %d / %d candidates",
+                    len(self.approved), len(self._candidates))
+        self._confirmed = True
+        self.grab_release()
+        self.destroy()
+
+    def _on_skip(self):
+        self.approved = []
+        logger.info("Hebrew review: user skipped (0 candidates approved)")
+        self._confirmed = False
+        self.grab_release()
+        self.destroy()
+
+
 class SplashScreen(tk.Toplevel):
     """Full-window splash shown while the NLP engine loads."""
 
@@ -1586,6 +1930,7 @@ class App(tk.Tk):
         custom_entries = self._get_custom_pii_entries()
 
         def task():
+            """Phase 1: Read file and run NLP detection in background thread."""
             try:
                 logger.info("Anonymize task started: input=%s", os.path.basename(inp))
                 text = read_file(inp)
@@ -1593,31 +1938,81 @@ class App(tk.Tk):
                 engine = PIIEngine.get()
                 anon_text, mapping, detections = engine.anonymize(
                     text, confidence=confidence, entities=selected_entities)
-                # Apply manual custom PII on top of NLP results
-                if custom_entries:
-                    logger.debug("Applying %d custom PII entries", len(custom_entries))
-                    entity_counts: Dict[str, int] = {}
-                    value_to_ph: Dict[str, str] = {ph: orig for ph, orig in mapping.items()}
-                    # Rebuild entity_counts from existing mapping
-                    for ph in mapping:
-                        m = re.match(r'\{\{([A-Z_]+)_(\d+)\}\}', ph)
-                        if m:
-                            lbl, num = m.group(1), int(m.group(2))
-                            entity_counts[lbl] = max(entity_counts.get(lbl, 0), num)
-                    anon_text = apply_custom_pii(
-                        anon_text, custom_entries,
-                        mapping, entity_counts, value_to_ph, detections)
-                write_file(out, anon_text)
-                logger.debug("Anonymized output written: %s", out)
-                with open(mapf, "w", encoding="utf-8") as fh:
-                    json.dump(mapping, fh, indent=4, ensure_ascii=False)
-                logger.info("Mapping file written: %s (%d entries)", mapf, len(mapping))
-                self.after(0, lambda: self._on_anonymize_done(anon_text, mapping, detections, out, mapf))
+
+                # --- Hebrew ambiguity review ---
+                # If the document is Hebrew, find ambiguous candidates not caught by NLP
+                lang = detect_language(text)
+                if lang == "he":
+                    already_mapped = set(mapping.values())
+                    candidates = find_hebrew_ambiguous_candidates(text, already_mapped)
+                    logger.debug("Hebrew ambiguity candidates: %d", len(candidates))
+                else:
+                    candidates = []
+
+                # Post to UI thread for optional review dialog, then finalize
+                self.after(0, lambda: self._on_nlp_done(
+                    text, anon_text, mapping, detections,
+                    candidates, custom_entries, out, mapf
+                ))
             except Exception as exc:
                 logger.error("Anonymize task failed: %s", exc, exc_info=True)
                 self.after(0, lambda: self._on_error(str(exc)))
 
         threading.Thread(target=task, daemon=True).start()
+
+    def _on_nlp_done(self, original_text, anon_text, mapping, detections,
+                     candidates, custom_entries, out, mapf):
+        """
+        Phase 2 (UI thread): optionally show Hebrew review dialog,
+        apply approved candidates + custom entries, then write output files.
+        """
+        # Show Hebrew review dialog if there are ambiguous candidates
+        approved_hebrew = []
+        if candidates:
+            self._stop_spinner()  # pause spinner while user reviews
+            self._set_status(
+                f"Hebrew review: {len(candidates)} ambiguous term(s) found — please confirm.",
+                WARNING
+            )
+            dlg = HebrewReviewDialog(self, candidates)
+            self.wait_window(dlg)  # blocks UI until dialog is closed
+            approved_hebrew = dlg.approved
+            self._start_spinner("Finalizing anonymization...")
+            self._set_status("Finalizing...", WARNING)
+
+        try:
+            # Rebuild helper dicts from existing mapping
+            entity_counts: Dict[str, int] = {}
+            value_to_ph: Dict[str, str] = {v: k for k, v in mapping.items()}
+            for ph in list(mapping.keys()):
+                m = re.match(r'\{\{([A-Z_]+)_(\d+)\}\}', ph)
+                if m:
+                    lbl, num = m.group(1), int(m.group(2))
+                    entity_counts[lbl] = max(entity_counts.get(lbl, 0), num)
+
+            # Apply Hebrew-approved candidates
+            if approved_hebrew:
+                logger.info("Applying %d Hebrew-approved candidates", len(approved_hebrew))
+                anon_text = apply_custom_pii(
+                    anon_text, approved_hebrew,
+                    mapping, entity_counts, value_to_ph, detections)
+
+            # Apply manual custom PII entries
+            if custom_entries:
+                logger.debug("Applying %d custom PII entries", len(custom_entries))
+                anon_text = apply_custom_pii(
+                    anon_text, custom_entries,
+                    mapping, entity_counts, value_to_ph, detections)
+
+            write_file(out, anon_text)
+            logger.debug("Anonymized output written: %s", out)
+            with open(mapf, "w", encoding="utf-8") as fh:
+                json.dump(mapping, fh, indent=4, ensure_ascii=False)
+            logger.info("Mapping file written: %s (%d entries)", mapf, len(mapping))
+            self._on_anonymize_done(anon_text, mapping, detections, out, mapf)
+        except Exception as exc:
+            logger.error("Finalize anonymize failed: %s", exc, exc_info=True)
+            self._on_error(str(exc))
 
     def _on_anonymize_done(self, anon_text, mapping, detections, out, mapf):
         self._stop_spinner()
