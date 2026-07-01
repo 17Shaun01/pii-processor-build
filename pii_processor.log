@@ -1,0 +1,42 @@
+2026-06-23 11:25:29  INFO      MainThread    ============================================================
+2026-06-23 11:25:29  INFO      MainThread    PII Processor v5.2 started
+2026-06-23 11:25:29  INFO      MainThread    Log file: /home/ubuntu/pii_win_build/pii_processor.log
+2026-06-23 11:25:29  INFO      MainThread    Python: 3.12.3
+2026-06-23 11:25:29  INFO      MainThread    Platform: linux
+2026-06-23 11:25:29  INFO      MainThread    ============================================================
+2026-06-23 11:25:31  INFO      MainThread    Test log message from headless test
+2026-06-23 11:25:31  WARNING   MainThread    Test warning message
+2026-06-23 11:25:31  ERROR     MainThread    Test error message
+2026-06-23 11:25:31  DEBUG     MainThread    This debug message should NOT appear at INFO level
+2026-06-23 11:25:31  DEBUG     MainThread    This debug message SHOULD appear at DEBUG level
+2026-06-23 11:25:31  INFO      MainThread    Anonymize: lang=en, chars=38, confidence=0.55, entities=21
+2026-06-23 11:25:32  DEBUG     MainThread    English analyzer: 2 raw results
+2026-06-23 11:25:32  DEBUG     MainThread    After overlap resolution: 2 results
+2026-06-23 11:25:32  DEBUG     MainThread      Detected: {{IL_PHONE_1}}  type=IL_PHONE         score=0.85  lang=en
+2026-06-23 11:25:32  DEBUG     MainThread      Detected: {{PERSON_1}}  type=PERSON           score=0.85  lang=en
+2026-06-23 11:25:32  INFO      MainThread    Anonymize complete: 2 unique PII items, 2 total detections
+2026-06-24 08:06:48  INFO      MainThread    ============================================================
+2026-06-24 08:06:48  INFO      MainThread    PII Processor v5.2 started
+2026-06-24 08:06:48  INFO      MainThread    Log file: /home/ubuntu/pii_win_build/pii_processor.log
+2026-06-24 08:06:48  INFO      MainThread    Python: 3.12.3
+2026-06-24 08:06:48  INFO      MainThread    Platform: linux
+2026-06-24 08:06:48  INFO      MainThread    ============================================================
+2026-06-24 08:06:52  DEBUG     MainThread    Hebrew ambiguity scan: 2 candidates found
+2026-06-24 08:06:52  DEBUG     MainThread    Hebrew ambiguity scan: 1 candidates found
+2026-06-24 08:06:52  DEBUG     MainThread    Hebrew ambiguity scan: 3 candidates found
+2026-06-24 08:06:52  DEBUG     MainThread    Hebrew ambiguity scan: 0 candidates found
+2026-06-24 08:06:54  INFO      MainThread    Anonymize: lang=he, chars=63, confidence=0.30, entities=21
+2026-06-24 08:06:54  WARNING   MainThread    Hebrew analyzer failed: No matching recognizers were found to serve the request.
+2026-06-24 08:06:54  DEBUG     MainThread    English analyzer (Hebrew doc): 1 raw results
+2026-06-24 08:06:54  DEBUG     MainThread    After overlap resolution: 1 results
+2026-06-24 08:06:54  DEBUG     MainThread      Detected: {{DATE_1}}  type=DATE             score=1.00  lang=he
+2026-06-24 08:06:54  INFO      MainThread    Anonymize complete: 1 unique PII items, 1 total detections
+2026-06-24 08:06:54  DEBUG     MainThread    Hebrew ambiguity scan: 2 candidates found
+2026-07-01 13:28:43  INFO      MainThread    ============================================================
+2026-07-01 13:28:43  INFO      MainThread    PII Processor v0.5.4 started
+2026-07-01 13:28:43  INFO      MainThread    Log file: /home/ubuntu/pii_win_build/pii_processor.log
+2026-07-01 13:28:43  INFO      MainThread    Python: 3.12.3
+2026-07-01 13:28:43  INFO      MainThread    Platform: linux
+2026-07-01 13:28:43  INFO      MainThread    ============================================================
+2026-07-01 13:28:47  INFO      MainThread    Restore: 6 placeholders to replace
+2026-07-01 13:28:47  INFO      MainThread    Restore complete

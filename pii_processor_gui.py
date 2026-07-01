@@ -40,7 +40,7 @@ import datetime
 # ---------------------------------------------------------------------------
 #  Version — bump this for every release
 # ---------------------------------------------------------------------------
-APP_VERSION = "0.5.3"
+APP_VERSION = "0.5.4"
 UPDATE_MANIFEST_URL = (
     "https://github.com/17Shaun01/pii-processor-build/"
     "releases/latest/download/version.json"
@@ -803,6 +803,83 @@ def apply_custom_pii(text: str, entries: List[dict],
 
 
 # ---------------------------------------------------------------------------
+#  Translation map helpers
+# ---------------------------------------------------------------------------
+
+TRANSLATION_MAP_FILENAME = "_mapping_translated.json"
+
+
+def _get_translation_map_path(mapping_path: str) -> str:
+    """Return the sibling translation-map path for a given mapping.json path."""
+    base = os.path.splitext(mapping_path)[0]
+    # Strip trailing '_mapping' if present, then add '_mapping_translated'
+    if base.endswith("_mapping"):
+        base = base[:-len("_mapping")]
+    return base + "_mapping_translated.json"
+
+
+def generate_translation_map(mapping: Dict[str, str]) -> Dict[str, dict]:
+    """
+    Build a translation map from an anonymization mapping.
+
+    The translation map has the structure:
+        { placeholder: { "original": str, "translated": str, "entity": str } }
+
+    The 'translated' field is pre-filled with:
+      - A known English transliteration for Hebrew names/locations (from HEBREW_TRANSLITERATIONS)
+      - The original value unchanged for structured PII (IDs, phones, emails, dates, IBANs)
+      - An empty string for anything else (user must fill in manually)
+    """
+    try:
+        from hebrew_data import HEBREW_TRANSLITERATIONS
+    except ImportError:
+        HEBREW_TRANSLITERATIONS = {}
+
+    # Entity types where the value should be copied unchanged (same in both languages)
+    COPY_AS_IS = {"IL_ID", "PHONE_NUMBER", "PHONE", "EMAIL_ADDRESS", "EMAIL",
+                  "IBAN_CODE", "IBAN", "CREDIT_CARD", "DATE_TIME", "DATE",
+                  "IL_PHONE", "IL_IBAN", "IL_DATE", "US_SSN", "US_PASSPORT"}
+
+    result = {}
+    for ph, original in mapping.items():
+        # Extract entity type from placeholder like {{PERSON_1}}
+        m = re.match(r'\{\{([A-Z_]+)_(\d+)\}\}', ph)
+        entity = m.group(1) if m else "CUSTOM"
+
+        # Determine pre-filled translation
+        if entity in COPY_AS_IS:
+            # Structured PII — keep the same value in both languages
+            translated = original
+        else:
+            # Try to look up word by word in the transliteration dict
+            # This handles multi-word names like "דוד לוי" -> "David Levy"
+            words = original.split()
+            translated_words = []
+            all_found = True
+            for word in words:
+                clean = word.strip(".,;:()\"'")
+                if clean in HEBREW_TRANSLITERATIONS:
+                    translated_words.append(HEBREW_TRANSLITERATIONS[clean])
+                else:
+                    all_found = False
+                    translated_words.append("")
+            if all_found and translated_words:
+                translated = " ".join(translated_words)
+            elif any(t for t in translated_words):
+                # Partial match — join what we have, blanks for unknowns
+                translated = " ".join(t if t else "?" for t in translated_words)
+            else:
+                translated = ""
+
+        result[ph] = {
+            "original": original,
+            "translated": translated,
+            "entity": entity,
+        }
+    return result
+
+
+# ---------------------------------------------------------------------------
 #  Reusable styled widgets
 # ---------------------------------------------------------------------------
 
@@ -1549,20 +1626,23 @@ class App(tk.Tk):
 
         self._tab_anon    = tk.Frame(nb, bg=DARK_BG)
         self._tab_restore = tk.Frame(nb, bg=DARK_BG)
+        self._tab_transmap = tk.Frame(nb, bg=DARK_BG)
         self._tab_batch   = tk.Frame(nb, bg=DARK_BG)
         self._tab_custom  = tk.Frame(nb, bg=DARK_BG)
         self._tab_debug   = tk.Frame(nb, bg=DARK_BG)
         self._tab_about   = tk.Frame(nb, bg=DARK_BG)
 
-        nb.add(self._tab_anon,    text="  \U0001f512  Anonymize  ")
-        nb.add(self._tab_restore, text="  \U0001f513  Restore  ")
-        nb.add(self._tab_batch,   text="  \U0001f4c2  Batch Folder  ")
-        nb.add(self._tab_custom,  text="  \u270f  Custom PII  ")
-        nb.add(self._tab_debug,   text="  \U0001f41b  Debug Log  ")
-        nb.add(self._tab_about,   text="  \u2139  About  ")
+        nb.add(self._tab_anon,     text="  \U0001f512  Anonymize  ")
+        nb.add(self._tab_restore,  text="  \U0001f513  Restore  ")
+        nb.add(self._tab_transmap, text="  \U0001f310  Translation Map  ")
+        nb.add(self._tab_batch,    text="  \U0001f4c2  Batch Folder  ")
+        nb.add(self._tab_custom,   text="  \u270f  Custom PII  ")
+        nb.add(self._tab_debug,    text="  \U0001f41b  Debug Log  ")
+        nb.add(self._tab_about,    text="  \u2139  About  ")
 
         self._build_anonymize_tab()
         self._build_restore_tab()
+        self._build_translation_map_tab()
         self._build_batch_tab()
         self._build_custom_pii_tab()
         self._build_debug_tab()
@@ -1677,41 +1757,336 @@ class App(tk.Tk):
         panel = tk.Frame(left, bg=PANEL_BG, bd=0)
         panel.pack(fill="both", expand=True, pady=(0, 8))
 
-        section_label(panel, "INPUT / OUTPUT").pack(anchor="w", padx=14, pady=(14, 4))
+        section_label(panel, "RESTORE MODE").pack(anchor="w", padx=14, pady=(14, 4))
+
+        self._restore_mode = tk.StringVar(value="original")
+        mode_frame = tk.Frame(panel, bg=PANEL_BG)
+        mode_frame.pack(fill="x", padx=14, pady=(0, 8))
+        tk.Radiobutton(mode_frame, text="Restore original PII",
+                       variable=self._restore_mode, value="original",
+                       bg=PANEL_BG, fg=TEXT_MAIN, selectcolor=ENTRY_BG,
+                       font=("Segoe UI", 9), activebackground=PANEL_BG,
+                       command=self._on_restore_mode_change).pack(anchor="w")
+        tk.Radiobutton(mode_frame, text="Restore translated PII",
+                       variable=self._restore_mode, value="translated",
+                       bg=PANEL_BG, fg=TEXT_MAIN, selectcolor=ENTRY_BG,
+                       font=("Segoe UI", 9), activebackground=PANEL_BG,
+                       command=self._on_restore_mode_change).pack(anchor="w")
+
+        tk.Frame(panel, bg=BORDER, height=1).pack(fill="x", padx=14, pady=(4, 10))
+        section_label(panel, "INPUT / OUTPUT").pack(anchor="w", padx=14, pady=(0, 4))
 
         self._rest_input  = tk.StringVar()
         self._rest_map    = tk.StringVar()
+        self._rest_transmap = tk.StringVar()
         self._rest_output = tk.StringVar()
 
-        for lbl, var, cmd in [
-            ("Anonymized document", self._rest_input,  self._browse_rest_input),
-            ("Mapping file",        self._rest_map,    self._browse_rest_map),
-            ("Restored output",     self._rest_output, self._browse_rest_out),
-        ]:
-            entry_row(panel, lbl, var, cmd).pack(fill="x", padx=14, pady=3)
+        entry_row(panel, "Anonymized document", self._rest_input,
+                  self._browse_rest_input).pack(fill="x", padx=14, pady=3)
+        entry_row(panel, "Mapping file", self._rest_map,
+                  self._browse_rest_map).pack(fill="x", padx=14, pady=3)
 
-        tk.Frame(panel, bg=BORDER, height=1).pack(fill="x", padx=14, pady=14)
+        # Translation map row — shown only in translated mode (not packed initially)
+        self._rest_transmap_row = entry_row(panel, "Translation map", self._rest_transmap,
+                                            self._browse_rest_transmap)
+        # Output row — stored as reference for before= positioning
+        self._rest_output_row = entry_row(panel, "Restored output", self._rest_output,
+                                          self._browse_rest_out)
+        self._rest_output_row.pack(fill="x", padx=14, pady=3)
+
+        tk.Frame(panel, bg=BORDER, height=1).pack(fill="x", padx=14, pady=10)
 
         info_box = tk.Frame(panel, bg=ENTRY_BG, bd=0)
         info_box.pack(fill="x", padx=14, pady=(0, 10))
-        tk.Label(info_box,
-                 text="Workflow:\n\n"
+        self._restore_info_lbl = tk.Label(info_box,
+                 text="Restore original PII:\n\n"
                       "1. Anonymize your document\n"
-                      "2. Send anonymized text to cloud AI\n"
-                      "   (ChatGPT, Claude, Gemini, etc.)\n"
+                      "2. Send to cloud AI / translator\n"
                       "3. Save the AI response to a file\n"
-                      "4. Load it here as \'Anonymized document\'\n"
-                      "5. Click Restore — done!\n\n"
-                      "Works with English and Hebrew.\n"
-                      "Hebrew names: 700+ Israeli names\n"
-                      "dictionary + multilingual NER.",
+                      "4. Load it as 'Anonymized document'\n"
+                      "5. Load the original mapping.json\n"
+                      "6. Click Restore\n\n"
+                      "For translated documents, switch\n"
+                      "to 'Restore translated PII' mode.",
+                 bg=ENTRY_BG, fg=TEXT_DIM, font=("Segoe UI", 9),
+                 justify="left", padx=12, pady=10)
+        self._restore_info_lbl.pack()
+
+        self._restore_btn = styled_button(panel, "\U0001f513  Restore Original PII",
+                                          self._run_restore, width=28)
+        self._restore_btn.pack(padx=14, pady=(0, 14))
+
+        self._build_preview_area(right, "rest")
+
+    def _on_restore_mode_change(self):
+        """Show/hide the translation map row and update button label."""
+        mode = self._restore_mode.get()
+        if mode == "translated":
+            # Insert the translation map row after the mapping file row
+            self._rest_transmap_row.pack(fill="x", padx=14, pady=3,
+                                         before=self._rest_output_row)
+            self._restore_btn.config(text="\U0001f310  Restore Translated PII")
+            self._restore_info_lbl.config(
+                text="Restore translated PII:\n\n"
+                     "1. Anonymize your document\n"
+                     "2. Review Translation Map tab\n"
+                     "3. Translate the anonymized doc\n"
+                     "   (DeepL, ChatGPT, etc.)\n"
+                     "4. Load translated doc here\n"
+                     "5. Load the translation map\n"
+                     "6. Click Restore\n\n"
+                     "Result: translated document\n"
+                     "with correct PII in target language.")
+        else:
+            self._rest_transmap_row.pack_forget()
+            self._restore_btn.config(text="\U0001f513  Restore Original PII")
+            self._restore_info_lbl.config(
+                text="Restore original PII:\n\n"
+                     "1. Anonymize your document\n"
+                     "2. Send to cloud AI / translator\n"
+                     "3. Save the AI response to a file\n"
+                     "4. Load it as 'Anonymized document'\n"
+                     "5. Load the original mapping.json\n"
+                     "6. Click Restore\n\n"
+                     "For translated documents, switch\n"
+                     "to 'Restore translated PII' mode.")
+
+    def _browse_rest_transmap(self):
+        path = filedialog.askopenfilename(
+            title="Select translation map file",
+            filetypes=[("JSON files", "*.json"), ("All files", "*.*")])
+        if path:
+            self._rest_transmap.set(path)
+
+    # -----------------------------------------------------------------------
+    #  Translation Map tab
+    # -----------------------------------------------------------------------
+
+    def _build_translation_map_tab(self):
+        tab = self._tab_transmap
+        left = tk.Frame(tab, bg=DARK_BG, width=340)
+        left.pack(side="left", fill="y", padx=(12, 6), pady=12)
+        left.pack_propagate(False)
+        right = tk.Frame(tab, bg=DARK_BG)
+        right.pack(side="left", fill="both", expand=True, padx=(0, 12), pady=12)
+
+        panel = tk.Frame(left, bg=PANEL_BG)
+        panel.pack(fill="both", expand=True)
+
+        section_label(panel, "TRANSLATION MAP FILE").pack(anchor="w", padx=14, pady=(14, 4))
+
+        self._transmap_path = tk.StringVar()
+        entry_row(panel, "Map file", self._transmap_path,
+                  self._browse_transmap).pack(fill="x", padx=14, pady=3)
+
+        tk.Frame(panel, bg=BORDER, height=1).pack(fill="x", padx=14, pady=12)
+
+        info_box = tk.Frame(panel, bg=ENTRY_BG)
+        info_box.pack(fill="x", padx=14, pady=(0, 10))
+        tk.Label(info_box,
+                 text="How to use:\n\n"
+                      "1. Anonymize a document — the\n"
+                      "   translation map is auto-loaded.\n\n"
+                      "2. Review the table on the right.\n"
+                      "   Edit any \"Translated\" cell that\n"
+                      "   needs correction.\n\n"
+                      "3. Click Save Map.\n\n"
+                      "4. Translate the anonymized doc\n"
+                      "   (DeepL, ChatGPT, etc.).\n\n"
+                      "5. In the Restore tab, load the\n"
+                      "   translated doc + this map file.",
                  bg=ENTRY_BG, fg=TEXT_DIM, font=("Segoe UI", 9),
                  justify="left", padx=12, pady=10).pack()
 
-        styled_button(panel, "\U0001f513  Restore Original PII", self._run_restore,
-                      width=28).pack(padx=14, pady=(0, 14))
+        styled_button(panel, "\U0001f4be  Save Map", self._save_transmap,
+                      width=28).pack(padx=14, pady=(0, 4))
+        styled_button(panel, "\U0001f4c2  Load Map File", self._browse_transmap,
+                      bg=PANEL_BG, width=28).pack(padx=14, pady=(0, 14))
 
-        self._build_preview_area(right, "rest")
+        # Right side: editable table
+        hdr = tk.Frame(right, bg=DARK_BG)
+        hdr.pack(fill="x", pady=(0, 6))
+        section_label(hdr, "PII TRANSLATION TABLE").pack(side="left", padx=4)
+        tk.Label(hdr, text="Double-click a \"Translated\" cell to edit",
+                 bg=DARK_BG, fg=TEXT_DIM, font=("Segoe UI", 8)).pack(side="left", padx=12)
+
+        cols = ("Placeholder", "Entity", "Original", "Translated")
+        self._transmap_tv = ttk.Treeview(right, columns=cols, show="headings", height=22)
+        style = ttk.Style()
+        style.configure("Treeview", background=ENTRY_BG, foreground=TEXT_MAIN,
+                        fieldbackground=ENTRY_BG, rowheight=26, font=("Consolas", 9))
+        col_widths = {"Placeholder": 160, "Entity": 120, "Original": 220, "Translated": 220}
+        for col in cols:
+            self._transmap_tv.heading(col, text=col)
+            self._transmap_tv.column(col, width=col_widths[col], anchor="w")
+        vsb = ttk.Scrollbar(right, orient="vertical", command=self._transmap_tv.yview)
+        self._transmap_tv.configure(yscrollcommand=vsb.set)
+        vsb.pack(side="right", fill="y")
+        self._transmap_tv.pack(fill="both", expand=True)
+        self._transmap_tv.bind("<Double-1>", self._transmap_edit_cell)
+
+        # Tag for rows with empty translation (needs attention)
+        self._transmap_tv.tag_configure("needs_review", foreground=WARNING)
+        self._transmap_tv.tag_configure("ok", foreground=SUCCESS)
+
+        btn_row = tk.Frame(right, bg=DARK_BG)
+        btn_row.pack(fill="x", pady=(6, 0))
+        tk.Button(btn_row, text="Auto-fill Suggestions",
+                  command=self._transmap_autofill,
+                  bg=ACCENT, fg="white", font=("Segoe UI", 9, "bold"),
+                  relief="flat", cursor="hand2", padx=10, pady=6).pack(side="left")
+        tk.Button(btn_row, text="Clear Translated Column",
+                  command=self._transmap_clear_translated,
+                  bg=BORDER, fg=TEXT_MAIN, font=("Segoe UI", 9),
+                  relief="flat", cursor="hand2", padx=10, pady=6).pack(side="left", padx=(8, 0))
+
+        # Internal state
+        self._transmap_data: Dict[str, dict] = {}  # ph -> {original, translated, entity}
+        self._transmap_file_path: Optional[str] = None
+
+    def _browse_transmap(self):
+        path = filedialog.askopenfilename(
+            title="Select translation map file",
+            filetypes=[("JSON files", "*.json"), ("All files", "*.*")])
+        if path:
+            self._load_translation_map_file(path)
+
+    def _load_translation_map_file(self, path: str):
+        """Load a *_mapping_translated.json into the editor table."""
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            # Accept both formats:
+            #   new: {ph: {original, translated, entity}}
+            #   legacy plain mapping: {ph: original_str}
+            normalized = {}
+            for ph, val in data.items():
+                if isinstance(val, dict):
+                    normalized[ph] = {
+                        "original":   val.get("original", ""),
+                        "translated": val.get("translated", ""),
+                        "entity":     val.get("entity", "CUSTOM"),
+                    }
+                else:
+                    # Plain mapping — generate translation suggestions
+                    plain_map = {ph2: v2 for ph2, v2 in data.items() if isinstance(v2, str)}
+                    normalized = generate_translation_map(plain_map)
+                    break
+            self._transmap_data = normalized
+            self._transmap_file_path = path
+            self._transmap_path.set(path)
+            self._refresh_transmap_table()
+            logger.info("Translation map loaded: %s (%d entries)", path, len(normalized))
+        except Exception as exc:
+            logger.error("Failed to load translation map: %s", exc, exc_info=True)
+            messagebox.showerror("Load Error", f"Could not load translation map:\n{exc}")
+
+    def _refresh_transmap_table(self):
+        """Repopulate the Treeview from self._transmap_data."""
+        for row in self._transmap_tv.get_children():
+            self._transmap_tv.delete(row)
+        for ph, info in self._transmap_data.items():
+            orig = info.get("original", "")
+            trans = info.get("translated", "")
+            entity = info.get("entity", "")
+            tag = "ok" if trans and trans != "?" else "needs_review"
+            self._transmap_tv.insert("", "end",
+                values=(ph, entity, orig, trans), tags=(tag,))
+
+    def _transmap_edit_cell(self, event):
+        """Allow inline editing of the Translated column on double-click."""
+        region = self._transmap_tv.identify_region(event.x, event.y)
+        if region != "cell":
+            return
+        col_id = self._transmap_tv.identify_column(event.x)
+        col_idx = int(col_id.replace("#", "")) - 1  # 0-based
+        if col_idx != 3:  # Only allow editing column 4 (Translated)
+            return
+        item = self._transmap_tv.identify_row(event.y)
+        if not item:
+            return
+        # Get cell bounding box
+        x, y, w, h = self._transmap_tv.bbox(item, col_id)
+        current_val = self._transmap_tv.item(item)["values"][3]
+        # Create a temporary Entry widget over the cell
+        edit_var = tk.StringVar(value=str(current_val))
+        entry = tk.Entry(self._transmap_tv, textvariable=edit_var,
+                         bg=ENTRY_BG, fg=TEXT_MAIN, insertbackground=TEXT_MAIN,
+                         relief="flat", font=("Consolas", 9), bd=2)
+        entry.place(x=x, y=y, width=w, height=h)
+        entry.focus_set()
+        entry.select_range(0, "end")
+
+        def _commit(event=None):
+            new_val = edit_var.get().strip()
+            vals = list(self._transmap_tv.item(item)["values"])
+            vals[3] = new_val
+            self._transmap_tv.item(item, values=vals)
+            # Update internal data
+            ph = vals[0]
+            if ph in self._transmap_data:
+                self._transmap_data[ph]["translated"] = new_val
+            tag = "ok" if new_val and new_val != "?" else "needs_review"
+            self._transmap_tv.item(item, tags=(tag,))
+            entry.destroy()
+
+        entry.bind("<Return>", _commit)
+        entry.bind("<FocusOut>", _commit)
+        entry.bind("<Escape>", lambda e: entry.destroy())
+
+    def _save_transmap(self):
+        """Save the current translation map data back to the JSON file."""
+        if not self._transmap_data:
+            messagebox.showwarning("Nothing to Save", "No translation map is loaded.")
+            return
+        path = self._transmap_file_path
+        if not path:
+            path = filedialog.asksaveasfilename(
+                title="Save translation map",
+                defaultextension=".json",
+                filetypes=[("JSON files", "*.json")])
+        if not path:
+            return
+        try:
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump(self._transmap_data, fh, indent=4, ensure_ascii=False)
+            self._transmap_file_path = path
+            self._transmap_path.set(path)
+            logger.info("Translation map saved: %s", path)
+            messagebox.showinfo("Saved",
+                f"Translation map saved:\n{path}\n\n"
+                f"Use this file in the Restore tab to de-anonymize a translated document.")
+        except Exception as exc:
+            logger.error("Failed to save translation map: %s", exc, exc_info=True)
+            messagebox.showerror("Save Error", f"Could not save:\n{exc}")
+
+    def _transmap_autofill(self):
+        """Re-run transliteration suggestions for all empty Translated cells."""
+        if not self._transmap_data:
+            messagebox.showwarning("Nothing Loaded", "Load a translation map first.")
+            return
+        # Rebuild suggestions only for empty/? entries
+        plain = {ph: info["original"] for ph, info in self._transmap_data.items()}
+        suggestions = generate_translation_map(plain)
+        filled = 0
+        for ph, info in self._transmap_data.items():
+            if not info.get("translated") or info["translated"] == "?":
+                suggestion = suggestions.get(ph, {}).get("translated", "")
+                if suggestion and suggestion != "?":
+                    self._transmap_data[ph]["translated"] = suggestion
+                    filled += 1
+        self._refresh_transmap_table()
+        messagebox.showinfo("Auto-fill Complete",
+            f"Filled {filled} empty translation(s) with suggestions.\n"
+            "Please review and correct any that are wrong.")
+
+    def _transmap_clear_translated(self):
+        """Clear all translated values (reset to empty for manual entry)."""
+        if not self._transmap_data:
+            return
+        for ph in self._transmap_data:
+            self._transmap_data[ph]["translated"] = ""
+        self._refresh_transmap_table()
 
     def _build_about_tab(self):
         tab = self._tab_about
@@ -2052,35 +2427,61 @@ class App(tk.Tk):
             with open(mapf, "w", encoding="utf-8") as fh:
                 json.dump(mapping, fh, indent=4, ensure_ascii=False)
             logger.info("Mapping file written: %s (%d entries)", mapf, len(mapping))
-            self._on_anonymize_done(anon_text, mapping, detections, out, mapf)
+            # Generate and write the translation map alongside the original mapping
+            trans_mapf = _get_translation_map_path(mapf)
+            try:
+                trans_map = generate_translation_map(mapping)
+                with open(trans_mapf, "w", encoding="utf-8") as fh:
+                    json.dump(trans_map, fh, indent=4, ensure_ascii=False)
+                logger.info("Translation map written: %s", trans_mapf)
+            except Exception as exc:
+                logger.warning("Could not write translation map: %s", exc)
+                trans_mapf = None
+            self._on_anonymize_done(anon_text, mapping, detections, out, mapf, trans_mapf)
         except Exception as exc:
             logger.error("Finalize anonymize failed: %s", exc, exc_info=True)
             self._on_error(str(exc))
 
-    def _on_anonymize_done(self, anon_text, mapping, detections, out, mapf):
+    def _on_anonymize_done(self, anon_text, mapping, detections, out, mapf, trans_mapf=None):
         self._stop_spinner()
         self._set_output_text(self._anon_txt_out, anon_text, detections)
         self._populate_table(self._anon_table, detections)
         n_unique = len(mapping)
         n_total  = len(detections)
         self._set_status(f"Done — {n_unique} unique PII items replaced ({n_total} total).", SUCCESS)
+        # Auto-load the translation map into the Translation Map tab
+        if trans_mapf and os.path.exists(trans_mapf):
+            self.after(0, lambda: self._load_translation_map_file(trans_mapf))
+        trans_note = (
+            f"\nTranslation map: {os.path.basename(trans_mapf) if trans_mapf else 'not generated'}\n"
+            f"  → Review in the \"Translation Map\" tab before restoring a translated document."
+        ) if trans_mapf else ""
         messagebox.showinfo("Anonymization Complete",
             f"Anonymization complete!\n\n"
             f"  Unique PII items replaced : {n_unique}\n"
             f"  Total occurrences         : {n_total}\n\n"
             f"Anonymized document: {out}\n"
-            f"Mapping file: {mapf}\n\n"
-            f"Safe to send to cloud AI.")
+            f"Mapping file: {mapf}{trans_note}\n\n"
+            f"Safe to send to cloud AI or translator.")
 
     def _run_restore(self):
         inp  = self._rest_input.get().strip()
         mapf = self._rest_map.get().strip()
         out  = self._rest_output.get().strip()
+        mode = self._restore_mode.get()
+        trans_mapf = self._rest_transmap.get().strip() if mode == "translated" else None
+
         if not inp:
             messagebox.showwarning("Missing Input", "Please select an anonymized document.")
             return
         if not mapf:
             messagebox.showwarning("Missing Mapping", "Please select a mapping file.")
+            return
+        if mode == "translated" and not trans_mapf:
+            messagebox.showwarning("Missing Translation Map",
+                "Please select a translation map file (.json) in the 'Translation map' field.\n\n"
+                "This file is generated automatically when you anonymize a document.\n"
+                "Review and edit it in the Translation Map tab first.")
             return
         if not out:
             messagebox.showwarning("Missing Output", "Please specify an output file path.")
@@ -2091,23 +2492,51 @@ class App(tk.Tk):
 
         def task():
             try:
-                logger.info("Restore task started: input=%s", os.path.basename(inp))
+                logger.info("Restore task started: mode=%s input=%s", mode, os.path.basename(inp))
                 text = read_file(inp)
                 logger.debug("Anonymized file read: %d chars", len(text))
-                with open(mapf, "r", encoding="utf-8") as fh:
-                    mapping = json.load(fh)
-                logger.debug("Mapping loaded: %d entries from %s", len(mapping), mapf)
-                restored = PIIEngine.restore(text, mapping)
+
+                if mode == "translated" and trans_mapf:
+                    # Load the translation map and build a flat {placeholder: translated_value} dict
+                    with open(trans_mapf, "r", encoding="utf-8") as fh:
+                        trans_data = json.load(fh)
+                    # Build flat restore mapping: ph -> translated value
+                    restore_mapping = {}
+                    for ph, info in trans_data.items():
+                        if isinstance(info, dict):
+                            translated = info.get("translated", "").strip()
+                            original   = info.get("original", "")
+                            # Use translated if available, fall back to original
+                            restore_mapping[ph] = translated if translated and translated != "?" else original
+                        else:
+                            restore_mapping[ph] = str(info)
+                    logger.debug("Translation mapping loaded: %d entries from %s",
+                                 len(restore_mapping), trans_mapf)
+                    # Also load the original mapping for any placeholders not in trans map
+                    with open(mapf, "r", encoding="utf-8") as fh:
+                        orig_mapping = json.load(fh)
+                    for ph, orig in orig_mapping.items():
+                        if ph not in restore_mapping:
+                            restore_mapping[ph] = orig
+                    display_mapping = restore_mapping
+                else:
+                    # Standard restore with original mapping
+                    with open(mapf, "r", encoding="utf-8") as fh:
+                        restore_mapping = json.load(fh)
+                    display_mapping = restore_mapping
+                    logger.debug("Mapping loaded: %d entries from %s", len(restore_mapping), mapf)
+
+                restored = PIIEngine.restore(text, restore_mapping)
                 write_file(out, restored)
                 logger.info("Restore complete: output written to %s", out)
-                self.after(0, lambda: self._on_restore_done(restored, mapping, out))
+                self.after(0, lambda: self._on_restore_done(restored, display_mapping, out, mode))
             except Exception as exc:
                 logger.error("Restore task failed: %s", exc, exc_info=True)
                 self.after(0, lambda: self._on_error(str(exc)))
 
         threading.Thread(target=task, daemon=True).start()
 
-    def _on_restore_done(self, restored, mapping, out):
+    def _on_restore_done(self, restored, mapping, out, mode="original"):
         self._stop_spinner()
         self._set_output_text(self._rest_txt_out, restored)
         fake_detections = [
@@ -2118,8 +2547,10 @@ class App(tk.Tk):
         ]
         self._populate_table(self._rest_table, fake_detections)
         self._set_status(f"Done — {len(mapping)} placeholders restored.", SUCCESS)
+        mode_label = "translated" if mode == "translated" else "original"
         messagebox.showinfo("Restoration Complete",
             f"Restoration complete!\n\n"
+            f"  Mode                  : {mode_label} PII\n"
             f"  Placeholders restored : {len(mapping)}\n\n"
             f"Restored document saved to:\n  {out}")
 
@@ -2659,6 +3090,14 @@ class App(tk.Tk):
                     write_file(out_path, anon_text)
                     with open(map_path, "w", encoding="utf-8") as fh:
                         json.dump(mapping, fh, indent=4, ensure_ascii=False)
+                    # Also write translation map for batch files
+                    try:
+                        trans_map_path = _get_translation_map_path(map_path)
+                        trans_map = generate_translation_map(mapping)
+                        with open(trans_map_path, "w", encoding="utf-8") as fh:
+                            json.dump(trans_map, fh, indent=4, ensure_ascii=False)
+                    except Exception as exc:
+                        logger.warning("Batch: could not write translation map for %s: %s", fname, exc)
                     n = len(mapping)
                     logger.info("Batch: OK  %s  -> %d PII items", fname, n)
                     self.after(0, lambda fn=fname, n=n:
