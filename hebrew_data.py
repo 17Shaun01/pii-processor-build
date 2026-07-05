@@ -1,4 +1,6 @@
 # -*- coding: utf-8 -*-
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2024-2026 17Shaun01
 # Hebrew name and location dictionaries for PII detection
 
 HEBREW_FIRST_NAMES = {
