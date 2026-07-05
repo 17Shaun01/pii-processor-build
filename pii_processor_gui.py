@@ -40,7 +40,7 @@ import datetime
 # ---------------------------------------------------------------------------
 #  Version — bump this for every release
 # ---------------------------------------------------------------------------
-APP_VERSION = "0.5.4"
+APP_VERSION = "0.5.5"
 UPDATE_MANIFEST_URL = (
     "https://github.com/17Shaun01/pii-processor-build/"
     "releases/latest/download/version.json"
@@ -235,6 +235,40 @@ ENTITY_LABELS: Dict[str, str] = {
 }
 ALL_ENTITIES = list(ENTITY_LABELS.keys())
 DEFAULT_CONFIDENCE = 0.55
+
+# ---------------------------------------------------------------------------
+#  Law citation exclusion — year numbers embedded in law/ordinance names
+#  are NOT personal PII and should never be replaced.
+# ---------------------------------------------------------------------------
+
+# Matches year numbers that are part of a law/ordinance citation:
+#   "Inheritance Law-1965", "Companies Ordinance, 5759",
+#   "חוק הירושה, תשכ\"ה", "פקודת החברות (נוסח חדש), תשמ\"ג"
+LAW_CITATION_RE = re.compile(
+    r'(?:'
+    # English: Law/Act/Ordinance/Regulation/Order/Decree + optional punctuation + 4-digit year
+    r'(?:Law|Act|Ordinance|Regulation|Order|Decree|Code|Statute|Rules|Bylaw)'
+    r'[\s,;\-–—]*\d{4}'
+    r'|'
+    # Hebrew: חוק/פקודה/תקנות/צו + anything + 4-digit year or Hebrew year (תש...)
+    r'(?:\u05d7\u05d5\u05e7|\u05e4\u05e7\u05d5\u05d3\u05d4|\u05ea\u05e7\u05e0\u05d5\u05ea|\u05e6\u05d5)'
+    r'[^\n]{0,60}?(?:\d{4}|\u05ea\u05e9[\u05d0-\u05ea\u05f3\u05f4\'"]{1,4})'
+    r')',
+    re.IGNORECASE
+)
+
+# Date granularity options — controls which date patterns are treated as PII
+DATE_GRANULARITY_FULL       = "full"        # DD/MM/YYYY only (default)
+DATE_GRANULARITY_MONTH_YEAR = "month_year"  # MM/YYYY and DD/MM/YYYY
+DATE_GRANULARITY_YEAR_ONLY  = "year_only"   # any year number (use with caution)
+DATE_GRANULARITY_NONE       = "none"        # dates are never PII
+
+# Possessive/genitive suffixes to strip from detected spans
+# English: "'s", "s'"  |  Hebrew: " של" (shel = of)
+POSSESSIVE_RE = re.compile(
+    r"(?:'s|s')$"        # English possessive
+    r"|(?:\s\u05e9\u05dc\s.*)?$"  # Hebrew " של" (strip trailing)
+)
 
 HE_ENTITY_NAMES: Dict[str, str] = {
     "PERSON":           "\u05e9\u05dd \u05d0\u05d3\u05dd",
@@ -653,14 +687,28 @@ class PIIEngine:
         return kept
 
     def anonymize(self, text: str, confidence: float = DEFAULT_CONFIDENCE,
-                  entities: Optional[List[str]] = None) -> Tuple[str, Dict, List]:
+                  entities: Optional[List[str]] = None,
+                  date_granularity: str = DATE_GRANULARITY_FULL,
+                  global_exclusions: Optional[set] = None) -> Tuple[str, Dict, List, List]:
+        """
+        Returns (anonymized_text, mapping, detections, skipped_items).
+        skipped_items is a list of dicts describing items excluded by global_exclusions.
+        """
         if entities is None:
             entities = ALL_ENTITIES
+        if global_exclusions is None:
+            global_exclusions = set()
+
+        # Build set of law-citation spans to protect from date detection
+        law_citation_spans = set()
+        for m in LAW_CITATION_RE.finditer(text):
+            law_citation_spans.add((m.start(), m.end()))
+            logger.debug("Law citation excluded from PII: %r", m.group())
 
         lang = detect_language(text)
         char_count = len(text)
-        logger.info("Anonymize: lang=%s, chars=%d, confidence=%.2f, entities=%d",
-                    lang, char_count, confidence, len(entities))
+        logger.info("Anonymize: lang=%s, chars=%d, confidence=%.2f, entities=%d, date_granularity=%s",
+                    lang, char_count, confidence, len(entities), date_granularity)
 
         if lang == "he":
             try:
@@ -692,11 +740,72 @@ class PIIEngine:
         entity_counts: Dict[str, int] = {}
         value_to_ph: Dict[str, str] = {}
         detections: List[dict] = []
+        skipped_items: List[dict] = []  # items excluded by global exclusions
 
         for result in sorted(resolved, key=lambda r: r.start, reverse=True):
             original = text[result.start:result.end]
             etype = self._map_entity(result.entity_type)
             label = ENTITY_LABELS.get(etype, etype)
+
+            # ── Possessive/genitive trimming ──────────────────────────────────
+            # If the span ends with "'s" or " של", trim to just the name part
+            trimmed = original
+            if label == "PERSON" or label == "LOCATION" or label == "ORGANIZATION":
+                # English possessive: "David's" → "David"
+                en_poss = re.search(r"'s$|s'$", trimmed)
+                if en_poss:
+                    trimmed = trimmed[:en_poss.start()]
+                # Hebrew genitive: "דוד של" → "דוד" (strip " של" suffix)
+                he_poss = re.search(r"\s\u05e9\u05dc$", trimmed)
+                if he_poss:
+                    trimmed = trimmed[:he_poss.start()]
+                if trimmed != original:
+                    logger.debug("Possessive trimmed: %r → %r", original, trimmed)
+                    # Adjust span to match trimmed value
+                    result = type(result)(
+                        entity_type=result.entity_type,
+                        start=result.start,
+                        end=result.start + len(trimmed),
+                        score=result.score,
+                    )
+                    original = trimmed
+
+            # ── Law citation exclusion ────────────────────────────────────────
+            # Skip date/year results that fall inside a law citation span
+            if label == "DATE" or etype in ("DATE_TIME", "IL_DATE"):
+                in_law = any(ls <= result.start and result.end <= le
+                             for ls, le in law_citation_spans)
+                if in_law:
+                    logger.debug("Date skipped (law citation): %r", original)
+                    continue
+
+                # ── Date granularity filter ───────────────────────────────────
+                if date_granularity == DATE_GRANULARITY_NONE:
+                    logger.debug("Date skipped (granularity=none): %r", original)
+                    continue
+                if date_granularity == DATE_GRANULARITY_FULL:
+                    # Only flag dates that have a day component (DD/MM/YYYY or DD.MM.YYYY)
+                    if not re.match(r'^\d{1,2}[/.]\d{1,2}[/.]\d{4}$', original.strip()):
+                        logger.debug("Date skipped (granularity=full, no day): %r", original)
+                        continue
+                elif date_granularity == DATE_GRANULARITY_MONTH_YEAR:
+                    # Flag DD/MM/YYYY and MM/YYYY but not bare years
+                    if not re.match(r'^\d{1,2}[/.](?:\d{1,2}[/.])?\d{4}$', original.strip()):
+                        logger.debug("Date skipped (granularity=month_year): %r", original)
+                        continue
+                # DATE_GRANULARITY_YEAR_ONLY: flag everything including bare years
+
+            # ── Global exclusion list ─────────────────────────────────────────
+            if original.strip() in global_exclusions or original.strip().lower() in {e.lower() for e in global_exclusions}:
+                logger.info("Global exclusion skipped: %r (type=%s)", original, label)
+                skipped_items.append({
+                    "text": original,
+                    "label": label,
+                    "score": result.score,
+                    "reason": "global_exclusion",
+                })
+                continue
+
             if original in value_to_ph:
                 ph = value_to_ph[original]
             else:
@@ -707,17 +816,23 @@ class PIIEngine:
             # Privacy-safe debug log: placeholder and label only, NOT the original value
             logger.debug("  Detected: %s  type=%-15s  score=%.2f  lang=%s",
                          ph, label, result.score, analysis_lang)
+            # Extract context (up to 60 chars around the entity, from the ORIGINAL text before replacement)
+            ctx_start = max(0, result.start - 40)
+            ctx_end   = min(len(text), result.end + 40)
+            context_snippet = text[ctx_start:result.start] + "[" + original + "]" + text[result.end:ctx_end]
+            context_snippet = context_snippet.replace("\n", " ").strip()
             detections.append({
                 "placeholder": ph, "original": original,
                 "label": label, "score": result.score,
                 "start": result.start, "end": result.end,
                 "lang": analysis_lang,
+                "context": context_snippet,
             })
             text = text[:result.start] + ph + text[result.end:]
 
-        logger.info("Anonymize complete: %d unique PII items, %d total detections",
-                    len(mapping), len(detections))
-        return text, mapping, detections
+        logger.info("Anonymize complete: %d unique PII items, %d total detections, %d globally excluded",
+                    len(mapping), len(detections), len(skipped_items))
+        return text, mapping, detections, skipped_items
 
     @staticmethod
     def restore(text: str, mapping: Dict[str, str]) -> str:
@@ -765,6 +880,53 @@ def save_project_pii(folder: str, entries: List[dict]) -> None:
     path = get_project_pii_path(folder)
     with open(path, "w", encoding="utf-8") as fh:
         json.dump(entries, fh, indent=2, ensure_ascii=False)
+
+# ---------------------------------------------------------------------------
+#  Global exclusion list helpers (cross-matter, stored next to the .exe)
+# ---------------------------------------------------------------------------
+
+GLOBAL_EXCLUSIONS_FILENAME = "global_exclusions.json"
+
+def _get_global_exclusions_path() -> str:
+    """Return the path to the global exclusions file (next to the .exe or script)."""
+    if getattr(sys, 'frozen', False):
+        # Running as PyInstaller bundle
+        base = os.path.dirname(sys.executable)
+    else:
+        base = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(base, GLOBAL_EXCLUSIONS_FILENAME)
+
+
+def load_global_exclusions() -> List[dict]:
+    """
+    Load the global exclusion list.
+    Returns a list of dicts: [{"text": str, "label": str, "reason": str}, ...]
+    """
+    path = _get_global_exclusions_path()
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            if isinstance(data, list):
+                logger.info("Global exclusions loaded: %d entries from %s", len(data), path)
+                return data
+        except Exception as exc:
+            logger.warning("Failed to load global exclusions: %s", exc)
+    return []
+
+
+def save_global_exclusions(entries: List[dict]) -> None:
+    """Save the global exclusion list."""
+    path = _get_global_exclusions_path()
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(entries, fh, indent=2, ensure_ascii=False)
+    logger.info("Global exclusions saved: %d entries to %s", len(entries), path)
+
+
+def global_exclusions_as_set(entries: List[dict]) -> set:
+    """Return a set of excluded text values (case-insensitive lookup handled in anonymize)."""
+    return {e["text"].strip() for e in entries if e.get("text")}
+
 
 def apply_custom_pii(text: str, entries: List[dict],
                      mapping: Dict[str, str],
@@ -1271,6 +1433,301 @@ def find_hebrew_ambiguous_candidates(
     return result
 
 
+class EntityReviewDialog(tk.Toplevel):
+    """
+    Pre-anonymization review dialog.
+    Shows every detected entity and lets the user:
+      - Approve (yay) — include in anonymization
+      - Reject (nay) — skip this detection
+      - Add to Global Exclusions — never treat as PII again
+      - Add as Local Custom PII — add to project PII list
+    Also shows borderline items (low confidence) highlighted for extra attention.
+    """
+    BORDERLINE_THRESHOLD = 0.65
+
+    def __init__(self, parent, detections: list, global_exclusions: list):
+        super().__init__(parent)
+        self.title("\U0001f50d Review Detected PII — Confirm Before Anonymizing")
+        self.configure(bg=DARK_BG)
+        self.resizable(True, True)
+        self.geometry("980x680")
+        self.transient(parent)
+        self.grab_set()
+
+        # Results
+        self.approved: list = []        # detections user approved
+        self.rejected: list = []        # detections user rejected
+        self.add_to_global: list = []   # items to add to global exclusion list
+        self.add_to_local: list = []    # items to add to local custom PII
+        self._confirmed = False
+
+        self._detections = detections
+        self._global_exclusions = global_exclusions
+
+        # Per-row state: True=approved, False=rejected
+        self._row_state: Dict[str, bool] = {}
+        # Unique detections (by placeholder+original)
+        seen = set()
+        self._unique: list = []
+        for d in sorted(detections, key=lambda x: x["start"]):
+            key = (d["placeholder"], d["original"])
+            if key not in seen:
+                seen.add(key)
+                self._unique.append(d)
+                self._row_state[key] = True  # default: approved
+
+        self._build_ui()
+        self.protocol("WM_DELETE_WINDOW", self._on_confirm)  # treat close as confirm
+        self.update_idletasks()
+        # Centre on parent
+        x = parent.winfo_rootx() + (parent.winfo_width() - self.winfo_width()) // 2
+        y = parent.winfo_rooty() + (parent.winfo_height() - self.winfo_height()) // 2
+        self.geometry(f"+{x}+{y}")
+
+    def _build_ui(self):
+        # Header
+        hdr = tk.Frame(self, bg=PANEL_BG)
+        hdr.pack(fill="x", padx=0, pady=0)
+        tk.Label(hdr,
+            text=f"  {len(self._unique)} entities detected  —  "
+                 f"{sum(1 for d in self._unique if d['score'] < self.BORDERLINE_THRESHOLD)} borderline (highlighted in yellow)",
+            bg=PANEL_BG, fg=TEXT_MAIN, font=("Segoe UI", 10, "bold"), pady=10
+        ).pack(side="left", padx=14)
+        tk.Label(hdr,
+            text="Uncheck to skip. Right-click for options.",
+            bg=PANEL_BG, fg=TEXT_DIM, font=("Segoe UI", 9)
+        ).pack(side="left", padx=8)
+
+        # Toolbar
+        toolbar = tk.Frame(self, bg=DARK_BG)
+        toolbar.pack(fill="x", padx=12, pady=(6, 0))
+        tk.Button(toolbar, text="\u2714 Select All",
+                  command=lambda: self._set_all(True),
+                  bg=SUCCESS, fg=DARK_BG, font=("Segoe UI", 9, "bold"),
+                  relief="flat", cursor="hand2", padx=8, pady=4).pack(side="left", padx=(0, 6))
+        tk.Button(toolbar, text="\u2716 Deselect All",
+                  command=lambda: self._set_all(False),
+                  bg=BORDER, fg=TEXT_MAIN, font=("Segoe UI", 9),
+                  relief="flat", cursor="hand2", padx=8, pady=4).pack(side="left", padx=(0, 6))
+        tk.Button(toolbar, text="\u26a0 Select Only Borderline",
+                  command=self._select_borderline,
+                  bg="#7a6000", fg="#ffe066", font=("Segoe UI", 9),
+                  relief="flat", cursor="hand2", padx=8, pady=4).pack(side="left", padx=(0, 6))
+
+        # Treeview
+        frame = tk.Frame(self, bg=DARK_BG)
+        frame.pack(fill="both", expand=True, padx=12, pady=(6, 0))
+
+        cols = ("Approved", "Entity", "Label", "Confidence", "Occurrences", "Context")
+        self._tv = ttk.Treeview(frame, columns=cols, show="headings", height=22,
+                                selectmode="browse")
+        style = ttk.Style()
+        style.configure("Review.Treeview", background=ENTRY_BG, foreground=TEXT_MAIN,
+                         fieldbackground=ENTRY_BG, rowheight=26, font=("Segoe UI", 9))
+        self._tv.configure(style="Review.Treeview")
+        self._tv.tag_configure("borderline", background="#3a3000", foreground="#ffe066")
+        self._tv.tag_configure("approved",   background=ENTRY_BG,  foreground=TEXT_MAIN)
+        self._tv.tag_configure("rejected",   background="#2a0000",  foreground="#888")
+
+        widths = {"Approved": 70, "Entity": 200, "Label": 120,
+                  "Confidence": 90, "Occurrences": 90, "Context": 380}
+        for col in cols:
+            self._tv.heading(col, text=col)
+            self._tv.column(col, width=widths[col], anchor="center" if col in ("Approved", "Confidence", "Occurrences") else "w")
+
+        vsb = ttk.Scrollbar(frame, orient="vertical",   command=self._tv.yview)
+        hsb = ttk.Scrollbar(frame, orient="horizontal", command=self._tv.xview)
+        self._tv.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+        vsb.pack(side="right", fill="y")
+        hsb.pack(side="bottom", fill="x")
+        self._tv.pack(fill="both", expand=True)
+
+        # Populate rows
+        occ_count = {}
+        for d in self._detections:
+            key = (d["placeholder"], d["original"])
+            occ_count[key] = occ_count.get(key, 0) + 1
+
+        for d in self._unique:
+            key = (d["placeholder"], d["original"])
+            score = d["score"]
+            is_borderline = score < self.BORDERLINE_THRESHOLD
+            # Extract context: up to 60 chars around the entity
+            ctx = d.get("context", "")
+            tag = "borderline" if is_borderline else "approved"
+            self._tv.insert("", "end", iid=f"{key[0]}||{key[1]}",
+                values=(
+                    "\u2611" if self._row_state[key] else "\u2610",
+                    key[1],          # original text
+                    d["label"],
+                    f"{score:.2f}",
+                    occ_count.get(key, 1),
+                    ctx,
+                ),
+                tags=(tag,))
+
+        self._tv.bind("<Button-1>",   self._on_click)
+        self._tv.bind("<Button-3>",   self._on_right_click)
+        self._tv.bind("<Return>",     lambda e: self._toggle_selected())
+        self._tv.bind("<space>",      lambda e: self._toggle_selected())
+
+        # Context menu
+        self._ctx_menu = tk.Menu(self, tearoff=0, bg=PANEL_BG, fg=TEXT_MAIN,
+                                  activebackground=ACCENT, activeforeground="white")
+        self._ctx_menu.add_command(label="\u2611  Approve (include as PII)",
+                                   command=lambda: self._set_selected(True))
+        self._ctx_menu.add_command(label="\u2610  Reject (skip this detection)",
+                                   command=lambda: self._set_selected(False))
+        self._ctx_menu.add_separator()
+        self._ctx_menu.add_command(
+            label="\U0001f6ab  Add to Global Exclusions (never PII)",
+            command=self._ctx_add_global)
+        self._ctx_menu.add_command(
+            label="\u270f  Add to Local Custom PII (this matter only)",
+            command=self._ctx_add_local)
+
+        # Footer buttons
+        footer = tk.Frame(self, bg=PANEL_BG)
+        footer.pack(fill="x", padx=0, pady=(6, 0))
+        tk.Button(footer, text="\u2714  Confirm & Anonymize",
+                  command=self._on_confirm,
+                  bg=SUCCESS, fg=DARK_BG, font=("Segoe UI", 11, "bold"),
+                  relief="flat", cursor="hand2", padx=20, pady=10).pack(side="right", padx=14, pady=8)
+        tk.Button(footer, text="Cancel",
+                  command=self._on_cancel,
+                  bg=BORDER, fg=TEXT_MAIN, font=("Segoe UI", 10),
+                  relief="flat", cursor="hand2", padx=14, pady=10).pack(side="right", pady=8)
+        n_borderline = sum(1 for d in self._unique if d["score"] < self.BORDERLINE_THRESHOLD)
+        if n_borderline:
+            tk.Label(footer,
+                text=f"  \u26a0  {n_borderline} borderline detection(s) highlighted in yellow — please review carefully.",
+                bg=PANEL_BG, fg="#ffe066", font=("Segoe UI", 9)
+            ).pack(side="left", padx=14)
+
+    def _on_click(self, event):
+        """Toggle approval on checkbox column click."""
+        region = self._tv.identify_region(event.x, event.y)
+        col    = self._tv.identify_column(event.x)
+        iid    = self._tv.identify_row(event.y)
+        if region == "cell" and col == "#1" and iid:
+            self._toggle_iid(iid)
+
+    def _toggle_selected(self):
+        for iid in self._tv.selection():
+            self._toggle_iid(iid)
+
+    def _toggle_iid(self, iid: str):
+        parts = iid.split("||", 1)
+        if len(parts) != 2:
+            return
+        key = (parts[0], parts[1])
+        new_state = not self._row_state.get(key, True)
+        self._row_state[key] = new_state
+        self._tv.set(iid, "Approved", "\u2611" if new_state else "\u2610")
+        tag = "approved" if new_state else "rejected"
+        # Keep borderline styling if applicable
+        score = next((d["score"] for d in self._unique
+                      if d["placeholder"] == parts[0] and d["original"] == parts[1]), 1.0)
+        if not new_state:
+            tag = "rejected"
+        elif score < self.BORDERLINE_THRESHOLD:
+            tag = "borderline"
+        self._tv.item(iid, tags=(tag,))
+
+    def _set_all(self, state: bool):
+        for key in self._row_state:
+            self._row_state[key] = state
+            iid = f"{key[0]}||{key[1]}"
+            self._tv.set(iid, "Approved", "\u2611" if state else "\u2610")
+            score = next((d["score"] for d in self._unique
+                          if d["placeholder"] == key[0] and d["original"] == key[1]), 1.0)
+            tag = ("borderline" if state and score < self.BORDERLINE_THRESHOLD
+                   else "approved" if state else "rejected")
+            self._tv.item(iid, tags=(tag,))
+
+    def _select_borderline(self):
+        """Deselect all, then select only borderline items for focused review."""
+        for key in self._row_state:
+            score = next((d["score"] for d in self._unique
+                          if d["placeholder"] == key[0] and d["original"] == key[1]), 1.0)
+            state = score < self.BORDERLINE_THRESHOLD
+            self._row_state[key] = state
+            iid = f"{key[0]}||{key[1]}"
+            self._tv.set(iid, "Approved", "\u2611" if state else "\u2610")
+            self._tv.item(iid, tags=("borderline" if state else "rejected",))
+
+    def _on_right_click(self, event):
+        iid = self._tv.identify_row(event.y)
+        if iid:
+            self._tv.selection_set(iid)
+            self._ctx_menu.post(event.x_root, event.y_root)
+
+    def _set_selected(self, state: bool):
+        for iid in self._tv.selection():
+            parts = iid.split("||", 1)
+            if len(parts) == 2:
+                key = (parts[0], parts[1])
+                self._row_state[key] = state
+                self._tv.set(iid, "Approved", "\u2611" if state else "\u2610")
+                score = next((d["score"] for d in self._unique
+                              if d["placeholder"] == key[0] and d["original"] == key[1]), 1.0)
+                tag = ("borderline" if state and score < self.BORDERLINE_THRESHOLD
+                       else "approved" if state else "rejected")
+                self._tv.item(iid, tags=(tag,))
+
+    def _ctx_add_global(self):
+        import datetime
+        for iid in self._tv.selection():
+            parts = iid.split("||", 1)
+            if len(parts) == 2:
+                text = parts[1]
+                self.add_to_global.append({
+                    "text": text,
+                    "reason": "Marked not-PII during review",
+                    "added": datetime.date.today().isoformat()
+                })
+                # Also reject it
+                self._row_state[(parts[0], parts[1])] = False
+                self._tv.set(iid, "Approved", "\u2610")
+                self._tv.item(iid, tags=("rejected",))
+        if self.add_to_global:
+            messagebox.showinfo("Added to Global Exclusions",
+                f"{len(self.add_to_global)} item(s) added to global exclusion list.\n"
+                f"They will be excluded from all future documents.\n"
+                f"Remember to save the list in the \U0001f6ab Exclusions tab.",
+                parent=self)
+
+    def _ctx_add_local(self):
+        for iid in self._tv.selection():
+            parts = iid.split("||", 1)
+            if len(parts) == 2:
+                text = parts[1]
+                label = next((d["label"] for d in self._unique
+                              if d["placeholder"] == parts[0] and d["original"] == parts[1]),
+                             "CUSTOM")
+                self.add_to_local.append({"text": text, "label": label})
+        if self.add_to_local:
+            messagebox.showinfo("Added to Local Custom PII",
+                f"{len(self.add_to_local)} item(s) will be added to the project custom PII list.",
+                parent=self)
+
+    def _on_confirm(self):
+        self._confirmed = True
+        # Build approved list: all detections whose key is approved
+        approved_keys = {k for k, v in self._row_state.items() if v}
+        self.approved = [d for d in self._detections
+                         if (d["placeholder"], d["original"]) in approved_keys]
+        self.rejected = [d for d in self._detections
+                         if (d["placeholder"], d["original"]) not in approved_keys]
+        self.destroy()
+
+    def _on_cancel(self):
+        # Cancel = approve all (don't block the workflow)
+        self.approved = list(self._detections)
+        self.rejected = []
+        self.destroy()
+
+
 class HebrewReviewDialog(tk.Toplevel):
     """
     Modal dialog shown after Hebrew NLP detection.
@@ -1558,6 +2015,11 @@ class App(tk.Tk):
         self.configure(bg=DARK_BG)
         self._engine_ready = False
         self._updater = Updater(self)
+        # Load global exclusions at startup (cross-matter, stored next to the .exe)
+        self._global_exclusions: List[dict] = load_global_exclusions()
+        self._date_granularity = tk.StringVar(value=DATE_GRANULARITY_FULL)
+        # Whether to show the entity review dialog before anonymizing
+        self._show_entity_review = tk.BooleanVar(value=True)
 
         # Show splash immediately, hide main window until engine is ready
         self.withdraw()
@@ -1629,6 +2091,7 @@ class App(tk.Tk):
         self._tab_transmap = tk.Frame(nb, bg=DARK_BG)
         self._tab_batch   = tk.Frame(nb, bg=DARK_BG)
         self._tab_custom  = tk.Frame(nb, bg=DARK_BG)
+        self._tab_exclude = tk.Frame(nb, bg=DARK_BG)
         self._tab_debug   = tk.Frame(nb, bg=DARK_BG)
         self._tab_about   = tk.Frame(nb, bg=DARK_BG)
 
@@ -1637,6 +2100,7 @@ class App(tk.Tk):
         nb.add(self._tab_transmap, text="  \U0001f310  Translation Map  ")
         nb.add(self._tab_batch,    text="  \U0001f4c2  Batch Folder  ")
         nb.add(self._tab_custom,   text="  \u270f  Custom PII  ")
+        nb.add(self._tab_exclude,  text="  \U0001f6ab  Exclusions  ")
         nb.add(self._tab_debug,    text="  \U0001f41b  Debug Log  ")
         nb.add(self._tab_about,    text="  \u2139  About  ")
 
@@ -1645,6 +2109,7 @@ class App(tk.Tk):
         self._build_translation_map_tab()
         self._build_batch_tab()
         self._build_custom_pii_tab()
+        self._build_exclusions_tab()
         self._build_debug_tab()
         self._build_about_tab()
 
@@ -1739,6 +2204,38 @@ class App(tk.Tk):
         tk.Button(sel_row, text="Clear All", command=self._clear_all_entities,
                   bg=BORDER, fg=TEXT_MAIN, font=("Segoe UI", 8), relief="flat",
                   cursor="hand2", padx=6).pack(side="left")
+
+        # ── Date granularity setting ──────────────────────────────────────
+        tk.Frame(panel, bg=BORDER, height=1).pack(fill="x", padx=14, pady=10)
+        section_label(panel, "DATE SETTINGS").pack(anchor="w", padx=14, pady=(0, 6))
+
+        date_row = tk.Frame(panel, bg=PANEL_BG)
+        date_row.pack(fill="x", padx=14, pady=(0, 4))
+        tk.Label(date_row, text="Date granularity", bg=PANEL_BG, fg=TEXT_MAIN,
+                 font=("Segoe UI", 9), width=18, anchor="w").pack(side="left")
+        ttk.Combobox(date_row, textvariable=self._date_granularity,
+                     values=[
+                         DATE_GRANULARITY_FULL,
+                         DATE_GRANULARITY_MONTH_YEAR,
+                         DATE_GRANULARITY_YEAR_ONLY,
+                         DATE_GRANULARITY_NONE,
+                     ],
+                     state="readonly", width=16, font=("Segoe UI", 9)).pack(side="left")
+        tk.Label(date_row, text="  (law citations always excluded)",
+                 bg=PANEL_BG, fg=TEXT_DIM, font=("Segoe UI", 8)).pack(side="left")
+
+        # ── Entity review dialog toggle ───────────────────────────────────
+        tk.Frame(panel, bg=BORDER, height=1).pack(fill="x", padx=14, pady=10)
+        section_label(panel, "REVIEW OPTIONS").pack(anchor="w", padx=14, pady=(0, 6))
+        review_row = tk.Frame(panel, bg=PANEL_BG)
+        review_row.pack(fill="x", padx=14, pady=(0, 4))
+        tk.Checkbutton(review_row, text="Show entity review dialog before anonymizing",
+                       variable=self._show_entity_review,
+                       bg=PANEL_BG, fg=TEXT_MAIN, selectcolor=ENTRY_BG,
+                       activebackground=PANEL_BG, activeforeground=TEXT_MAIN,
+                       font=("Segoe UI", 9), anchor="w").pack(side="left")
+        tk.Label(review_row, text="  (approve / reject each detection)",
+                 bg=PANEL_BG, fg=TEXT_DIM, font=("Segoe UI", 8)).pack(side="left")
 
         tk.Frame(panel, bg=BORDER, height=1).pack(fill="x", padx=14, pady=10)
         styled_button(panel, "\U0001f512  Remove PII / Anonymize", self._run_anonymize,
@@ -2341,6 +2838,9 @@ class App(tk.Tk):
 
         selected_entities = [e for e, v in self._entity_vars.items() if v.get()]
         confidence = self._confidence.get()
+        date_granularity = self._date_granularity.get()
+        global_excl_set = global_exclusions_as_set(self._global_exclusions)
+        show_review = self._show_entity_review.get()
         self._start_spinner("Anonymizing document...")
         self._set_status("Anonymizing...", WARNING)
 
@@ -2354,8 +2854,10 @@ class App(tk.Tk):
                 text = read_file(inp)
                 logger.debug("File read: %d chars from %s", len(text), inp)
                 engine = PIIEngine.get()
-                anon_text, mapping, detections = engine.anonymize(
-                    text, confidence=confidence, entities=selected_entities)
+                anon_text, mapping, detections, skipped_items = engine.anonymize(
+                    text, confidence=confidence, entities=selected_entities,
+                    date_granularity=date_granularity,
+                    global_exclusions=global_excl_set)
 
                 # --- Hebrew ambiguity review ---
                 # If the document is Hebrew, find ambiguous candidates not caught by NLP
@@ -2367,11 +2869,12 @@ class App(tk.Tk):
                 else:
                     candidates = []
 
-                # Post to UI thread for optional review dialog, then finalize
-                self.after(0, lambda: self._on_nlp_done(
-                    text, anon_text, mapping, detections,
-                    candidates, custom_entries, out, mapf
-                ))
+                # Post to UI thread — Phase 2: entity review (if enabled), then Hebrew review
+                self.after(0, lambda _t=text, _a=anon_text, _m=mapping, _d=detections,
+                                      _c=candidates, _ce=custom_entries, _si=skipped_items:
+                    self._on_nlp_done(_t, _a, _m, _d, _c, _ce, _si, out, mapf,
+                                      show_review=show_review)
+                )
             except Exception as exc:
                 logger.error("Anonymize task failed: %s", exc, exc_info=True)
                 self.after(0, lambda: self._on_error(str(exc)))
@@ -2379,12 +2882,71 @@ class App(tk.Tk):
         threading.Thread(target=task, daemon=True).start()
 
     def _on_nlp_done(self, original_text, anon_text, mapping, detections,
-                     candidates, custom_entries, out, mapf):
+                     candidates, custom_entries, skipped_items, out, mapf,
+                     show_review: bool = True):
         """
-        Phase 2 (UI thread): optionally show Hebrew review dialog,
-        apply approved candidates + custom entries, then write output files.
+        Phase 2 (UI thread):
+          1. Optionally show EntityReviewDialog (pre-anonymization entity review).
+          2. Apply user's approve/reject decisions: remove rejected items from mapping,
+             save add_to_global items, queue add_to_local items.
+          3. Optionally show HebrewReviewDialog for ambiguous Hebrew candidates.
+          4. Apply approved Hebrew + custom PII entries, then write output files.
         """
-        # Show Hebrew review dialog if there are ambiguous candidates
+        # ── Phase 2a: Entity Review Dialog ────────────────────────────────────
+        if show_review and detections:
+            self._stop_spinner()  # pause spinner while user reviews
+            self._set_status(
+                f"Entity review: {len(detections)} detection(s) — please confirm before anonymizing.",
+                WARNING
+            )
+            dlg = EntityReviewDialog(self, detections, self._global_exclusions)
+            self.wait_window(dlg)  # blocks UI until dialog is closed
+
+            if not dlg._confirmed and not dlg.approved and not dlg.rejected:
+                # User closed window without confirming — treat as cancel (approve all)
+                pass  # dlg.approved already set to all detections in _on_cancel
+
+            # Apply rejections: remove rejected placeholders from mapping and detections
+            rejected_phs = {d["placeholder"] for d in dlg.rejected}
+            if rejected_phs:
+                logger.info("Entity review: %d detection(s) rejected by user", len(dlg.rejected))
+                # Remove rejected placeholders from mapping
+                for ph in rejected_phs:
+                    mapping.pop(ph, None)
+                # Remove rejected detections from detections list
+                detections[:] = [d for d in detections if d["placeholder"] not in rejected_phs]
+                # Restore rejected text in anon_text (replace placeholder back with original)
+                for d in dlg.rejected:
+                    anon_text = anon_text.replace(d["placeholder"], d["original"])
+                logger.info("Rejected placeholders restored in anonymized text")
+
+            # Apply add_to_global: extend global exclusions list and save
+            if dlg.add_to_global:
+                existing_texts = {e["text"].lower() for e in self._global_exclusions}
+                added = 0
+                for entry in dlg.add_to_global:
+                    if entry["text"].lower() not in existing_texts:
+                        self._global_exclusions.append(entry)
+                        existing_texts.add(entry["text"].lower())
+                        added += 1
+                if added:
+                    save_global_exclusions(self._global_exclusions)
+                    self._refresh_excl_table()
+                    logger.info("Global exclusions: %d new item(s) added and saved", added)
+
+            # Apply add_to_local: merge into custom_entries for this run
+            if dlg.add_to_local:
+                existing_custom = {e["text"].lower() for e in custom_entries}
+                for entry in dlg.add_to_local:
+                    if entry["text"].lower() not in existing_custom:
+                        custom_entries.append(entry)
+                        existing_custom.add(entry["text"].lower())
+                logger.info("Local custom PII: %d item(s) added for this run", len(dlg.add_to_local))
+
+            self._start_spinner("Finalizing anonymization...")
+            self._set_status("Finalizing...", WARNING)
+
+        # ── Phase 2b: Hebrew Ambiguity Review ─────────────────────────────────
         approved_hebrew = []
         if candidates:
             self._stop_spinner()  # pause spinner while user reviews
@@ -2437,24 +2999,26 @@ class App(tk.Tk):
             except Exception as exc:
                 logger.warning("Could not write translation map: %s", exc)
                 trans_mapf = None
-            self._on_anonymize_done(anon_text, mapping, detections, out, mapf, trans_mapf)
+            self._on_anonymize_done(anon_text, mapping, detections, out, mapf, trans_mapf,
+                                     skipped_items)
         except Exception as exc:
             logger.error("Finalize anonymize failed: %s", exc, exc_info=True)
             self._on_error(str(exc))
 
-    def _on_anonymize_done(self, anon_text, mapping, detections, out, mapf, trans_mapf=None):
+    def _on_anonymize_done(self, anon_text, mapping, detections, out, mapf,
+                           trans_mapf=None, skipped_items=None):
         self._stop_spinner()
         self._set_output_text(self._anon_txt_out, anon_text, detections)
         self._populate_table(self._anon_table, detections)
         n_unique = len(mapping)
         n_total  = len(detections)
-        self._set_status(f"Done — {n_unique} unique PII items replaced ({n_total} total).", SUCCESS)
+        self._set_status(f"Done \u2014 {n_unique} unique PII items replaced ({n_total} total).", SUCCESS)
         # Auto-load the translation map into the Translation Map tab
         if trans_mapf and os.path.exists(trans_mapf):
             self.after(0, lambda: self._load_translation_map_file(trans_mapf))
         trans_note = (
             f"\nTranslation map: {os.path.basename(trans_mapf) if trans_mapf else 'not generated'}\n"
-            f"  → Review in the \"Translation Map\" tab before restoring a translated document."
+            f"  \u2192 Review in the \"Translation Map\" tab before restoring a translated document."
         ) if trans_mapf else ""
         messagebox.showinfo("Anonymization Complete",
             f"Anonymization complete!\n\n"
@@ -2463,6 +3027,18 @@ class App(tk.Tk):
             f"Anonymized document: {out}\n"
             f"Mapping file: {mapf}{trans_note}\n\n"
             f"Safe to send to cloud AI or translator.")
+        # Show skip report if any items were excluded by the global exclusion list
+        if skipped_items:
+            lines = [f"  \u2022 \"{s['text']}\"  [{s['label']}]  (confidence {s['score']:.2f})"
+                     for s in skipped_items]
+            report = "\n".join(lines)
+            messagebox.showinfo(
+                f"Skipped Items Report ({len(skipped_items)} item(s))",
+                f"The following detections were SKIPPED because they appear in your\n"
+                f"Global Exclusion List:\n\n{report}\n\n"
+                f"To remove an item from the exclusion list, go to the\n"
+                f"\U0001f6ab Exclusions tab."
+            )
 
     def _run_restore(self):
         inp  = self._rest_input.get().strip()
@@ -2603,6 +3179,155 @@ class App(tk.Tk):
                 ))
 
         threading.Thread(target=_check, daemon=True).start()
+
+    # -----------------------------------------------------------------------
+    #  Global Exclusions tab
+    # -----------------------------------------------------------------------
+
+    def _build_exclusions_tab(self):
+        """Build the Global Exclusions tab — words/phrases that are never PII."""
+        tab = self._tab_exclude
+        left = tk.Frame(tab, bg=DARK_BG, width=360)
+        left.pack(side="left", fill="y", padx=(12, 6), pady=12)
+        left.pack_propagate(False)
+        right = tk.Frame(tab, bg=DARK_BG)
+        right.pack(side="left", fill="both", expand=True, padx=(0, 12), pady=12)
+
+        panel = tk.Frame(left, bg=PANEL_BG)
+        panel.pack(fill="both", expand=True)
+
+        section_label(panel, "GLOBAL EXCLUSION LIST").pack(anchor="w", padx=14, pady=(14, 4))
+        tk.Label(panel,
+            text="Words/phrases in this list will never be treated as PII.\n"
+                 "Applies to ALL documents across all matters.\n"
+                 "Skipped items are reported at the end of each run.",
+            bg=PANEL_BG, fg=TEXT_DIM, font=("Segoe UI", 8), wraplength=310, justify="left"
+        ).pack(anchor="w", padx=14, pady=(0, 8))
+
+        excl_path = _get_global_exclusions_path()
+        self._excl_path_lbl = tk.Label(panel,
+            text=f"File: {excl_path}",
+            bg=PANEL_BG, fg=TEXT_DIM, font=("Segoe UI", 7), wraplength=310, justify="left")
+        self._excl_path_lbl.pack(anchor="w", padx=14, pady=(0, 8))
+
+        tk.Frame(panel, bg=BORDER, height=1).pack(fill="x", padx=14, pady=4)
+        section_label(panel, "ADD NEW EXCLUSION").pack(anchor="w", padx=14, pady=(0, 6))
+
+        self._new_excl_text   = tk.StringVar()
+        self._new_excl_reason = tk.StringVar(value="Legal term")
+
+        entry_row(panel, "Word / phrase", self._new_excl_text).pack(fill="x", padx=14, pady=3)
+        entry_row(panel, "Reason", self._new_excl_reason).pack(fill="x", padx=14, pady=3)
+
+        styled_button(panel, "+ Add to Global Exclusions",
+                      self._add_exclusion_entry, bg=SUCCESS, fg=DARK_BG, width=28
+                      ).pack(padx=14, pady=(8, 4))
+
+        tk.Frame(panel, bg=BORDER, height=1).pack(fill="x", padx=14, pady=8)
+        styled_button(panel, "\U0001f4be  Save Exclusions",
+                      self._save_exclusions, width=28).pack(padx=14, pady=(0, 4))
+        styled_button(panel, "\U0001f504  Reload from Disk",
+                      self._reload_exclusions, bg=PANEL_BG, width=28).pack(padx=14, pady=(0, 14))
+
+        # Right side: list of current exclusions
+        section_label(right, "CURRENT GLOBAL EXCLUSIONS").pack(anchor="w", padx=4, pady=(4, 6))
+
+        cols = ("Word / Phrase", "Reason", "Added")
+        self._excl_tv = ttk.Treeview(right, columns=cols, show="headings", height=22)
+        style = ttk.Style()
+        style.configure("Treeview", background=ENTRY_BG, foreground=TEXT_MAIN,
+                         fieldbackground=ENTRY_BG, rowheight=24, font=("Consolas", 9))
+        self._excl_tv.heading("Word / Phrase", text="Word / Phrase")
+        self._excl_tv.heading("Reason",        text="Reason")
+        self._excl_tv.heading("Added",         text="Added")
+        self._excl_tv.column("Word / Phrase", width=260, anchor="w")
+        self._excl_tv.column("Reason",        width=200, anchor="w")
+        self._excl_tv.column("Added",         width=110, anchor="w")
+        vsb = ttk.Scrollbar(right, orient="vertical", command=self._excl_tv.yview)
+        self._excl_tv.configure(yscrollcommand=vsb.set)
+        vsb.pack(side="right", fill="y")
+        self._excl_tv.pack(fill="both", expand=True)
+
+        btn_row = tk.Frame(right, bg=DARK_BG)
+        btn_row.pack(fill="x", pady=(6, 0))
+        tk.Button(btn_row, text="\u274c  Remove Selected",
+                  command=self._remove_exclusion_entry,
+                  bg=DANGER, fg="white", font=("Segoe UI", 9, "bold"),
+                  relief="flat", cursor="hand2", padx=10, pady=6).pack(side="left")
+        tk.Button(btn_row, text="Clear All",
+                  command=self._clear_exclusions,
+                  bg=BORDER, fg=TEXT_MAIN, font=("Segoe UI", 9),
+                  relief="flat", cursor="hand2", padx=10, pady=6).pack(side="left", padx=(8, 0))
+
+        # Populate from already-loaded global exclusions
+        self._refresh_excl_table()
+
+    def _refresh_excl_table(self):
+        """Repopulate the exclusions treeview from self._global_exclusions."""
+        for row in self._excl_tv.get_children():
+            self._excl_tv.delete(row)
+        for e in self._global_exclusions:
+            self._excl_tv.insert("", "end", values=(
+                e.get("text", ""),
+                e.get("reason", ""),
+                e.get("added", ""),
+            ))
+
+    def _add_exclusion_entry(self):
+        text   = self._new_excl_text.get().strip()
+        reason = self._new_excl_reason.get().strip() or "Not PII"
+        if not text:
+            messagebox.showwarning("Empty Entry", "Please enter the word or phrase to exclude.")
+            return
+        # Duplicate check (case-insensitive)
+        existing = {e["text"].lower() for e in self._global_exclusions}
+        if text.lower() in existing:
+            messagebox.showinfo("Duplicate", f"'{text}' is already in the global exclusion list.")
+            return
+        import datetime
+        entry = {"text": text, "reason": reason,
+                 "added": datetime.date.today().isoformat()}
+        self._global_exclusions.append(entry)
+        self._excl_tv.insert("", "end", values=(text, reason, entry["added"]))
+        self._new_excl_text.set("")
+        logger.info("Global exclusion added: '%s' (%s)", text, reason)
+
+    def _remove_exclusion_entry(self):
+        selected = self._excl_tv.selection()
+        if not selected:
+            messagebox.showinfo("Nothing Selected",
+                "Click a row to select it, then click Remove.")
+            return
+        for item in selected:
+            vals = self._excl_tv.item(item)["values"]
+            removed_text = str(vals[0]) if vals else ""
+            self._excl_tv.delete(item)
+            self._global_exclusions = [
+                e for e in self._global_exclusions
+                if e.get("text", "").lower() != removed_text.lower()
+            ]
+            logger.info("Global exclusion removed: '%s'", removed_text)
+
+    def _clear_exclusions(self):
+        if messagebox.askyesno("Clear All",
+                "Remove ALL entries from the global exclusion list?"):
+            self._global_exclusions.clear()
+            for row in self._excl_tv.get_children():
+                self._excl_tv.delete(row)
+
+    def _save_exclusions(self):
+        save_global_exclusions(self._global_exclusions)
+        self._set_status(
+            f"Global exclusions saved ({len(self._global_exclusions)} entries).", SUCCESS)
+        messagebox.showinfo("Saved",
+            f"Global exclusion list saved:\n{_get_global_exclusions_path()}\n\n"
+            f"{len(self._global_exclusions)} entries will be applied to all future documents.")
+
+    def _reload_exclusions(self):
+        self._global_exclusions = load_global_exclusions()
+        self._refresh_excl_table()
+        self._set_status(
+            f"Global exclusions reloaded ({len(self._global_exclusions)} entries).", SUCCESS)
 
     # -----------------------------------------------------------------------
     #  Debug Log tab
@@ -3074,7 +3799,7 @@ class App(tk.Tk):
                     logger.info("Batch: processing %s", fname)
                     text = read_file(fpath)
                     engine = PIIEngine.get()
-                    anon_text, mapping, detections = engine.anonymize(
+                    anon_text, mapping, detections, _skipped = engine.anonymize(
                         text, confidence=confidence)
                     if merged_custom:
                         entity_counts: Dict[str, int] = {}

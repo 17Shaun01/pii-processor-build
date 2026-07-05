@@ -40,3 +40,95 @@
 2026-07-01 13:28:43  INFO      MainThread    ============================================================
 2026-07-01 13:28:47  INFO      MainThread    Restore: 6 placeholders to replace
 2026-07-01 13:28:47  INFO      MainThread    Restore complete
+2026-07-05 08:02:28  INFO      MainThread    ============================================================
+2026-07-05 08:02:28  INFO      MainThread    PII Processor v0.5.5 started
+2026-07-05 08:02:28  INFO      MainThread    Log file: /home/ubuntu/pii_win_build/pii_processor.log
+2026-07-05 08:02:28  INFO      MainThread    Python: 3.12.3
+2026-07-05 08:02:28  INFO      MainThread    Platform: linux
+2026-07-05 08:02:28  INFO      MainThread    ============================================================
+2026-07-05 08:02:33  INFO      MainThread    Anonymize: lang=en, chars=56, confidence=0.40, entities=21, date_granularity=full
+2026-07-05 08:02:33  DEBUG     MainThread    English analyzer: 5 raw results
+2026-07-05 08:02:33  DEBUG     MainThread    After overlap resolution: 3 results
+2026-07-05 08:02:33  DEBUG     MainThread      Detected: {{IL_PHONE_1}}  type=IL_PHONE         score=1.00  lang=en
+2026-07-05 08:02:33  DEBUG     MainThread      Detected: {{IL_PHONE_2}}  type=IL_PHONE         score=0.65  lang=en
+2026-07-05 08:02:33  DEBUG     MainThread      Detected: {{PERSON_1}}  type=PERSON           score=0.85  lang=en
+2026-07-05 08:02:33  INFO      MainThread    Anonymize complete: 3 unique PII items, 3 total detections, 0 globally excluded
+2026-07-05 08:02:53  INFO      MainThread    ============================================================
+2026-07-05 08:02:53  INFO      MainThread    PII Processor v0.5.5 started
+2026-07-05 08:02:53  INFO      MainThread    Log file: /home/ubuntu/pii_win_build/pii_processor.log
+2026-07-05 08:02:53  INFO      MainThread    Python: 3.12.3
+2026-07-05 08:02:53  INFO      MainThread    Platform: linux
+2026-07-05 08:02:53  INFO      MainThread    ============================================================
+2026-07-05 08:02:57  INFO      MainThread    Anonymize: lang=en, chars=56, confidence=0.40, entities=21, date_granularity=full
+2026-07-05 08:02:58  DEBUG     MainThread    English analyzer: 5 raw results
+2026-07-05 08:02:58  DEBUG     MainThread    After overlap resolution: 3 results
+2026-07-05 08:02:58  DEBUG     MainThread      Detected: {{IL_PHONE_1}}  type=IL_PHONE         score=1.00  lang=en
+2026-07-05 08:02:58  DEBUG     MainThread      Detected: {{IL_PHONE_2}}  type=IL_PHONE         score=0.65  lang=en
+2026-07-05 08:02:58  DEBUG     MainThread      Detected: {{PERSON_1}}  type=PERSON           score=0.85  lang=en
+2026-07-05 08:02:58  INFO      MainThread    Anonymize complete: 3 unique PII items, 3 total detections, 0 globally excluded
+2026-07-05 08:02:58  INFO      MainThread    Anonymize: lang=en, chars=67, confidence=0.40, entities=21, date_granularity=full
+2026-07-05 08:02:58  DEBUG     MainThread    English analyzer: 4 raw results
+2026-07-05 08:02:58  DEBUG     MainThread    After overlap resolution: 3 results
+2026-07-05 08:02:58  DEBUG     MainThread      Detected: {{EMAIL_1}}  type=EMAIL            score=1.00  lang=en
+2026-07-05 08:02:58  DEBUG     MainThread      Detected: {{DATE_1}}  type=DATE             score=0.75  lang=en
+2026-07-05 08:02:58  DEBUG     MainThread      Detected: {{PERSON_1}}  type=PERSON           score=0.85  lang=en
+2026-07-05 08:02:58  INFO      MainThread    Anonymize complete: 3 unique PII items, 3 total detections, 0 globally excluded
+2026-07-05 08:02:58  INFO      MainThread    Anonymize: lang=en, chars=59, confidence=0.40, entities=21, date_granularity=full
+2026-07-05 08:02:58  DEBUG     MainThread    English analyzer: 1 raw results
+2026-07-05 08:02:58  DEBUG     MainThread    After overlap resolution: 1 results
+2026-07-05 08:02:58  DEBUG     MainThread      Detected: {{PERSON_1}}  type=PERSON           score=0.85  lang=en
+2026-07-05 08:02:58  INFO      MainThread    Anonymize complete: 1 unique PII items, 1 total detections, 0 globally excluded
+2026-07-05 08:02:58  INFO      MainThread    Restore: 3 placeholders to replace
+2026-07-05 08:02:58  INFO      MainThread    Restore complete
+2026-07-05 08:02:58  INFO      MainThread    Restore: 3 placeholders to replace
+2026-07-05 08:02:58  INFO      MainThread    Restore complete
+2026-07-05 08:02:58  INFO      MainThread    Restore: 2 placeholders to replace
+2026-07-05 08:02:58  INFO      MainThread    Restore complete
+2026-07-05 08:03:04  INFO      MainThread    ============================================================
+2026-07-05 08:03:04  INFO      MainThread    PII Processor v0.5.5 started
+2026-07-05 08:03:04  INFO      MainThread    Log file: /home/ubuntu/pii_win_build/pii_processor.log
+2026-07-05 08:03:04  INFO      MainThread    Python: 3.12.3
+2026-07-05 08:03:04  INFO      MainThread    Platform: linux
+2026-07-05 08:03:04  INFO      MainThread    ============================================================
+2026-07-05 08:03:08  INFO      MainThread    Restore: 6 placeholders to replace
+2026-07-05 08:03:08  INFO      MainThread    Restore complete
+2026-07-05 08:03:09  INFO      MainThread    ============================================================
+2026-07-05 08:03:09  INFO      MainThread    PII Processor v0.5.5 started
+2026-07-05 08:03:09  INFO      MainThread    Log file: /home/ubuntu/pii_win_build/pii_processor.log
+2026-07-05 08:03:09  INFO      MainThread    Python: 3.12.3
+2026-07-05 08:03:09  INFO      MainThread    Platform: linux
+2026-07-05 08:03:09  INFO      MainThread    ============================================================
+2026-07-05 08:03:13  DEBUG     MainThread    Hebrew ambiguity scan: 2 candidates found
+2026-07-05 08:03:13  DEBUG     MainThread    Hebrew ambiguity scan: 1 candidates found
+2026-07-05 08:03:13  DEBUG     MainThread    Hebrew ambiguity scan: 3 candidates found
+2026-07-05 08:03:13  DEBUG     MainThread    Hebrew ambiguity scan: 0 candidates found
+2026-07-05 08:03:14  INFO      MainThread    Anonymize: lang=he, chars=63, confidence=0.30, entities=21, date_granularity=full
+2026-07-05 08:03:14  WARNING   MainThread    Hebrew analyzer failed: No matching recognizers were found to serve the request.
+2026-07-05 08:03:14  DEBUG     MainThread    English analyzer (Hebrew doc): 1 raw results
+2026-07-05 08:03:14  DEBUG     MainThread    After overlap resolution: 1 results
+2026-07-05 08:03:14  DEBUG     MainThread      Detected: {{DATE_1}}  type=DATE             score=1.00  lang=he
+2026-07-05 08:03:14  INFO      MainThread    Anonymize complete: 1 unique PII items, 1 total detections, 0 globally excluded
+2026-07-05 08:03:14  DEBUG     MainThread    Hebrew ambiguity scan: 2 candidates found
+2026-07-05 08:03:20  INFO      MainThread    ============================================================
+2026-07-05 08:03:20  INFO      MainThread    PII Processor v0.5.5 started
+2026-07-05 08:03:20  INFO      MainThread    Log file: /home/ubuntu/pii_win_build/pii_processor.log
+2026-07-05 08:03:20  INFO      MainThread    Python: 3.12.3
+2026-07-05 08:03:20  INFO      MainThread    Platform: linux
+2026-07-05 08:03:20  INFO      MainThread    ============================================================
+2026-07-05 08:03:24  INFO      MainThread    Anonymize: lang=he, chars=66, confidence=0.40, entities=21, date_granularity=full
+2026-07-05 08:03:24  WARNING   MainThread    Hebrew analyzer failed: No matching recognizers were found to serve the request.
+2026-07-05 08:03:24  DEBUG     MainThread    English analyzer (Hebrew doc): 7 raw results
+2026-07-05 08:03:24  DEBUG     MainThread    After overlap resolution: 3 results
+2026-07-05 08:03:24  DEBUG     MainThread      Detected: {{IL_PHONE_1}}  type=IL_PHONE         score=1.00  lang=he
+2026-07-05 08:03:24  DEBUG     MainThread    Date skipped (granularity=full, no day): '025478963'
+2026-07-05 08:03:24  DEBUG     MainThread      Detected: {{ORGANIZATION_1}}  type=ORGANIZATION     score=0.85  lang=he
+2026-07-05 08:03:24  INFO      MainThread    Anonymize complete: 2 unique PII items, 2 total detections, 0 globally excluded
+2026-07-05 08:03:24  INFO      MainThread    Anonymize: lang=en, chars=55, confidence=0.40, entities=21, date_granularity=full
+2026-07-05 08:03:24  DEBUG     MainThread    English analyzer: 5 raw results
+2026-07-05 08:03:24  DEBUG     MainThread    After overlap resolution: 3 results
+2026-07-05 08:03:24  DEBUG     MainThread      Detected: {{EMAIL_1}}  type=EMAIL            score=1.00  lang=en
+2026-07-05 08:03:24  DEBUG     MainThread      Detected: {{IL_PHONE_1}}  type=IL_PHONE         score=0.65  lang=en
+2026-07-05 08:03:24  DEBUG     MainThread      Detected: {{PERSON_1}}  type=PERSON           score=0.85  lang=en
+2026-07-05 08:03:24  INFO      MainThread    Anonymize complete: 3 unique PII items, 3 total detections, 0 globally excluded
+2026-07-05 08:03:24  INFO      MainThread    Restore: 2 placeholders to replace
+2026-07-05 08:03:24  INFO      MainThread    Restore complete

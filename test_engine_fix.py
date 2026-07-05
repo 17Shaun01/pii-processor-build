@@ -47,7 +47,7 @@ he_text = "הלקוח דוד לוי, ת.ז. 025478963, טלפון 052-1234567, �
 lang = detect_language(he_text)
 print(f"  Detected language: {lang}")
 assert lang == "he", f"Expected 'he', got '{lang}'"
-anon, mapping, detections = engine.anonymize(he_text, confidence=0.4)
+anon, mapping, detections, _skipped = engine.anonymize(he_text, confidence=0.4)
 print(f"  Input:      {he_text}")
 print(f"  Anonymized: {anon}")
 print(f"  Detected {len(mapping)} PII items: {list(mapping.values())}")
@@ -61,7 +61,7 @@ en_text = "Client John Smith, ID 025478963, email john@example.com"
 lang2 = detect_language(en_text)
 print(f"  Detected language: {lang2}")
 assert lang2 == "en", f"Expected 'en', got '{lang2}'"
-anon2, mapping2, detections2 = engine.anonymize(en_text, confidence=0.4)
+anon2, mapping2, detections2, _skipped2 = engine.anonymize(en_text, confidence=0.4)
 print(f"  Input:      {en_text}")
 print(f"  Anonymized: {anon2}")
 print(f"  Detected {len(mapping2)} PII items: {list(mapping2.values())}")

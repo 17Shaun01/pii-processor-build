@@ -168,7 +168,7 @@ print(f"  PASS: English document produces 0 Hebrew candidates")
 print()
 print("TEST 6: Full anonymize pipeline on Hebrew text")
 engine = PIIEngine.get()
-anon_text, mapping, detections = engine.anonymize(he_text, confidence=0.3)
+anon_text, mapping, detections, skipped_items = engine.anonymize(he_text, confidence=0.3)
 print(f"  NLP detected {len(mapping)} unique PII items:")
 for ph, orig in mapping.items():
     print(f"    {ph} -> '{orig}'")

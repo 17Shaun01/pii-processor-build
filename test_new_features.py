@@ -181,7 +181,7 @@ try:
     for fname in docs:
         fpath = os.path.join(tmpdir, fname)
         text = read_file(fpath)
-        anon_text, mapping, detections = engine.anonymize(text, confidence=0.4)
+        anon_text, mapping, detections, skipped_items = engine.anonymize(text, confidence=0.4)
         if folder_custom:
             ec = {}
             vp = {ph: orig for ph, orig in mapping.items()}
